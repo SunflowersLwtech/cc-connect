@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.5.1-beta.2 (2026-09-27)
+
+Second beta since v1.5.0 stable — 20 selected PRs focused on session correctness, agent continuity, channel attachment handling, authorization, and deterministic release coverage. See `changelogs/v1.5.1-beta.2.md` for the full list and contributors.
+
+### Fixed
+- **Core/session**: Exact usage-driven auto-compress, generation-counted busy locks, safe idle reset, stale workspace invalidation, late session-ID persistence, command-registry synchronization, and safer atomic temp writes (#1761, #1847, #1845, #1838, #1777, #1662, #1901, #1699)
+- **Claude Code/Codex**: Drop rejected hook drafts, preserve `AskUserQuestion` in bypass modes, persist Codex thread IDs before turn completion, and reject concurrent exec turns (#1855, #1880, #1623, #1881)
+- **Feishu**: Enforce `allow_from` for every card action (#1854)
+- **Slack**: Deduplicate messages delivered through both `app_mention` and `message` subscriptions (#1822)
+- **DingTalk**: Route group attachments through the group API and forward inline rich-text images (#1903, #1626)
+- **QQ Bot**: Forward quoted image attachments to agents (#1806)
+
+### Tests and Docs
+- Remove persistence-test cleanup races and add direct `DirHistory` coverage (#1911, #1663)
+- Add the official international Kimi Code link to both READMEs (#1876)
+
+### Breaking Changes
+- None
+
 ## v1.5.1-beta.1 (2026-08-28)
 
 Beta since v1.5.0 stable — 16 merged PRs focused on Feishu/Weixin reliability, Claude Code /compact, Codex reasoning, and Cursor image attachments. See `changelogs/v1.5.1-beta.1.md` for the full contributor list.

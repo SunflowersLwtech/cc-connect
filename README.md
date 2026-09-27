@@ -193,19 +193,19 @@ cc-connect already supports Kimi CLI. Try a **Kimi Code plan** ([中文站](http
 </p>
 
 
-## 🆕 What’s New in v1.5.1-beta.1
+## 🆕 What’s New in v1.5.1-beta.2
 
-Beta since v1.5.0 stable — 16 merged PRs. Highlights:
+Second beta since v1.5.0 stable — 20 selected PRs. Highlights:
 
-- **i18n** — Localize agent system prompts (cron/timer/send/relay) based on language config (#1721).
-- **Cursor** — Image attachments delivered via on-disk paths to the Cursor CLI (#1709).
-- **Feishu** — Large file download via HTTP Range chunks, bypassing code=234037 (#1746); fail-closed when bot open_id discovery fails (#1725).
-- **Weixin** — Reply and push paths now have separate send budgets (#1743); inbound dedup is configurable (#1733).
-- **Claude Code** — `/compact` and slash commands restored by dropping `--replay-user-messages` (#1737); bounded session teardown (#1714).
-- **Codex** — Failed app-server turns propagate (#1730); max reasoning effort supported (#1727); `/list` reads session names correctly (#1639).
-- **Pi** — Attachments passed as `@path` refs (#1724); Windows build fix (#1738).
+- **Core/session** — Exact usage-driven auto-compress, stronger busy-lock recovery, safe idle reset, stale workspace invalidation, and late session-ID persistence.
+- **Claude Code/Codex** — Preserve user questions in bypass modes, persist Codex thread IDs before completion, reject concurrent exec turns, and omit rejected hook drafts.
+- **Feishu** — Enforce `allow_from` on card actions so unauthorized members cannot approve operations.
+- **Slack** — Deduplicate the same message delivered through both `app_mention` and `message` subscriptions.
+- **DingTalk** — Send group attachments through the group API and forward inline rich-text images.
+- **QQ Bot** — Forward quoted image attachments to agents.
+- **Release confidence** — Remove persistence-test cleanup races and add direct `DirHistory` coverage.
 
-No breaking changes. See `changelogs/v1.5.1-beta.1.md` for the full changelog.
+No breaking changes. See `changelogs/v1.5.1-beta.2.md` for the full changelog.
 
 
 ## 🧩 Platform feature snapshot

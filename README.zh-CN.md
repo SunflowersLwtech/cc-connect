@@ -192,19 +192,19 @@ cc-connect 已支持 Kimi CLI。立即体验 **Kimi Code 订阅**（[中文站](
 </p>
 
 
-## 🆕 v1.5.1-beta.1 更新了什么
+## 🆕 v1.5.1-beta.2 更新了什么
 
-自 v1.5.0 正式版以来的 beta —— 16 个已合并 PR。亮点：
+自 v1.5.0 正式版以来的第二个 beta —— 精选 20 个 PR。亮点：
 
-- **i18n** — 按 language 配置本地化 agent system prompt（cron/timer/send/relay）(#1721)。
-- **Cursor** — 图片附件通过 on-disk path 传给 Cursor CLI (#1709)。
-- **飞书** — 大文件 HTTP Range 分块下载，绕过 code=234037 (#1746)；bot open_id 发现失败 fail-closed (#1725)。
-- **微信** — 回复/推送分路径 send budget (#1743)；入站 dedup 可配置 (#1733)。
-- **Claude Code** — 移除 `--replay-user-messages`，恢复 `/compact` 等 slash 命令 (#1737)；session teardown 竞态修复 (#1714)。
-- **Codex** — 传播 app-server turn 失败 (#1730)；支持 max reasoning effort (#1727)；`/list` 正确读 session 名 (#1639)。
-- **Pi** — 附件 @path 引用而非 inline bytes (#1724)；Windows 编译修复 (#1738)。
+- **核心/会话** — 按真实 usage 自动压缩、增强 busy lock 恢复、修复 idle reset、失效 workspace session 与延迟 session ID 持久化。
+- **Claude Code/Codex** — bypass 模式保留用户提问、Codex turn 完成前持久化 thread ID、拒绝同 session 并发 exec，并移除被拒绝的 hook 草稿。
+- **飞书** — 所有卡片动作执行 `allow_from` 校验，未授权成员不能替用户批准操作。
+- **Slack** — 同一消息通过 `app_mention` 和 `message` 双重投递时只处理一次。
+- **钉钉** — 群附件走群接口，并转发 richText 内联图片。
+- **QQ Bot** — 将引用消息中的图片附件传给 agent。
+- **发布可信度** — 消除持久化测试清理竞态，补齐 `DirHistory` 直接测试。
 
-无任何破坏性变更。完整 changelog 见 `changelogs/v1.5.1-beta.1.md`。
+无任何破坏性变更。完整 changelog 见 `changelogs/v1.5.1-beta.2.md`。
 
 
 ## 🧩 平台能力一览
