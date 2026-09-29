@@ -193,19 +193,19 @@ cc-connect already supports Kimi CLI. Try a **Kimi Code plan** ([中文站](http
 </p>
 
 
-## 🆕 What’s New in v1.5.1-beta.2
+## 🆕 What’s New in v1.5.1-beta.3
 
-Second beta since v1.5.0 stable — 20 selected PRs. Highlights:
+Third beta since v1.5.0 stable — 8 selected PRs on top of the tested beta.2 baseline. Highlights:
 
-- **Core/session** — Exact usage-driven auto-compress, stronger busy-lock recovery, safe idle reset, stale workspace invalidation, and late session-ID persistence.
-- **Claude Code/Codex** — Preserve user questions in bypass modes, persist Codex thread IDs before completion, reject concurrent exec turns, and omit rejected hook drafts.
-- **Feishu** — Enforce `allow_from` on card actions so unauthorized members cannot approve operations.
-- **Slack** — Deduplicate the same message delivered through both `app_mention` and `message` subscriptions.
-- **DingTalk** — Send group attachments through the group API and forward inline rich-text images.
-- **QQ Bot** — Forward quoted image attachments to agents.
-- **Release confidence** — Remove persistence-test cleanup races and add direct `DirHistory` coverage.
+- **Multi-workspace Web UI** — Configure workspace mode, base directory, and channel bindings from the project dashboard.
+- **Kimi Code** — Restore current transcript history and installed model discovery, filter injected records, and honor relocated data directories.
+- **Feishu and DingTalk** — Forward files attached to rich-text posts and preserve quoted/replied-to message context.
+- **Copilot** — Discover skills contributed by installed plugins.
+- **Cron** — Display timezone-pinned schedules and run times in their own timezone.
+- **macOS daemon** — Restart loaded launchd services in place more reliably.
+- **Workspace sessions** — Memory-only stores no longer leave stray workspace JSON files in the process directory.
 
-No breaking changes. See `changelogs/v1.5.1-beta.2.md` for the full changelog.
+No breaking changes. Automated release gates passed; real-channel QA continues on this beta. See `changelogs/v1.5.1-beta.3.md` for details.
 
 
 ## 🧩 Platform feature snapshot

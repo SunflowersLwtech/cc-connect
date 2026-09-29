@@ -192,19 +192,19 @@ cc-connect 已支持 Kimi CLI。立即体验 **Kimi Code 订阅**（[中文站](
 </p>
 
 
-## 🆕 v1.5.1-beta.2 更新了什么
+## 🆕 v1.5.1-beta.3 更新了什么
 
-自 v1.5.0 正式版以来的第二个 beta —— 精选 20 个 PR。亮点：
+自 v1.5.0 正式版以来的第三个 beta —— 在已测试的 beta.2 基线上精选 8 个 PR。亮点：
 
-- **核心/会话** — 按真实 usage 自动压缩、增强 busy lock 恢复、修复 idle reset、失效 workspace session 与延迟 session ID 持久化。
-- **Claude Code/Codex** — bypass 模式保留用户提问、Codex turn 完成前持久化 thread ID、拒绝同 session 并发 exec，并移除被拒绝的 hook 草稿。
-- **飞书** — 所有卡片动作执行 `allow_from` 校验，未授权成员不能替用户批准操作。
-- **Slack** — 同一消息通过 `app_mention` 和 `message` 双重投递时只处理一次。
-- **钉钉** — 群附件走群接口，并转发 richText 内联图片。
-- **QQ Bot** — 将引用消息中的图片附件传给 agent。
-- **发布可信度** — 消除持久化测试清理竞态，补齐 `DirHistory` 直接测试。
+- **多工作区 Web 管理** — 可在项目后台配置工作区模式、基础目录和渠道绑定。
+- **Kimi Code** — 恢复新版会话历史与已安装模型发现，过滤内部注入记录，并支持迁移后的数据目录。
+- **飞书与钉钉** — 转发富文本 post 顶层文件，并保留引用/回复消息上下文。
+- **Copilot** — 能发现已安装插件提供的 skills。
+- **Cron** — 带时区的计划和执行时间按计划自身时区正确展示。
+- **macOS daemon** — 对已加载的 launchd 服务执行更可靠的原地重启。
+- **工作区会话** — 纯内存 store 不再在进程目录遗留 workspace JSON 文件。
 
-无任何破坏性变更。完整 changelog 见 `changelogs/v1.5.1-beta.2.md`。
+无破坏性变更。自动化发版门禁已通过，真实渠道 QA 将在本 beta 上继续。完整 changelog 见 `changelogs/v1.5.1-beta.3.md`。
 
 
 ## 🧩 平台能力一览

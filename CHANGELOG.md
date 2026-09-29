@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.5.1-beta.3 (2026-09-29)
+
+Third beta since v1.5.0 stable — 8 selected PRs focused on multi-workspace administration, agent continuity, platform message fidelity, cron display correctness, and daemon reliability. See `changelogs/v1.5.1-beta.3.md` for the full list and contributors.
+
+### New Features
+- **Web dashboard**: Configure multi-workspace mode, base directories, and channel-to-workspace bindings from the project management UI (#1772)
+
+### Fixed
+- **DingTalk**: Detect quoted and replied-to messages in the rich-text inbound path (#1912)
+- **Copilot**: Expose plugin-provided skill roots to the agent (#1913)
+- **macOS daemon**: Restart a loaded launchd service in place instead of removing it first (#1915)
+- **Feishu**: Forward top-level file attachments carried by rich-text post messages (#1888)
+- **Kimi**: Restore current Kimi Code history, model discovery, injection filtering, and relocated `KIMI_CODE_HOME` session access (#1916)
+- **Cron**: Render `CRON_TZ`/`TZ` schedules and run times in the schedule's own timezone (#1922)
+- **Workspace sessions**: Stop memory-only session stores from creating stray workspace JSON files in the process directory (#1926)
+
+### Breaking Changes
+- None
+
 ## v1.5.1-beta.2 (2026-09-27)
 
 Second beta since v1.5.0 stable — 20 selected PRs focused on session correctness, agent continuity, channel attachment handling, authorization, and deterministic release coverage. See `changelogs/v1.5.1-beta.2.md` for the full list and contributors.
