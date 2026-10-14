@@ -1,7 +1,9 @@
 package feishu
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -244,6 +246,56 @@ func TestOnCardAction_NameLookupDoesNotBlockCallback(t *testing.T) {
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("card action never reached the engine handler")
+			}
+		})
+	}
+}
+
+// A lookup request that fails (dead connection, timeout) is logged at Warn, so
+// a degraded Open API connection is visible at the default log level. Business
+// errors such as a missing contact scope stay at Debug: they are not cached and
+// would otherwise log on every message.
+func TestNameLookup_FailureLogLevels(t *testing.T) {
+	cases := []struct {
+		name       string
+		chat, user lookupBehavior
+		wantWarn   []string // substrings that must appear on one WARN line
+		quiet      []string // messages that must not appear at Info level or above
+	}{
+		{"hung chat lookup warns", lookupHang, lookupNamed, []string{"resolve chat name failed", "chat_id=oc_x"}, nil},
+		{"hung user lookup warns", lookupNoName, lookupHang, []string{"resolve user name failed", "open_id=ou_alice"}, nil},
+		{"business errors stay at debug", lookupError, lookupError, nil, []string{"resolve chat name", "resolve user name"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setNameLookupTimeout(t, 100*time.Millisecond)
+			var buf bytes.Buffer
+			orig := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+			t.Cleanup(func() { slog.SetDefault(orig) })
+
+			p := newLookupServer(t, tc.chat, tc.user).platform(nil)
+			p.resolveUserName("ou_alice")
+			p.resolveChatName("oc_x")
+
+			logs := buf.String()
+			if len(tc.wantWarn) > 0 {
+				found := false
+				for _, line := range strings.Split(logs, "\n") {
+					ok := strings.Contains(line, "level=WARN")
+					for _, s := range tc.wantWarn {
+						ok = ok && strings.Contains(line, s)
+					}
+					found = found || ok
+				}
+				if !found {
+					t.Fatalf("no WARN line containing %q; logs:\n%s", tc.wantWarn, logs)
+				}
+			}
+			for _, s := range tc.quiet {
+				if strings.Contains(logs, s) {
+					t.Fatalf("%q logged at Info level or above; logs:\n%s", s, logs)
+				}
 			}
 		})
 	}
