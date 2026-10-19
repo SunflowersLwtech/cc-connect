@@ -726,8 +726,12 @@ type pendingPermission struct {
 	Questions       []UserQuestion // non-nil for AskUserQuestion
 	Answers         map[int]string // collected answers keyed by question index
 	CurrentQuestion int            // index of the question currently being asked
-	Resolved        chan struct{}  // closed when user responds
-	resolveOnce     sync.Once
+	// CardAnswerOnly is true when the current question was sent as a card
+	// with its own answer box, so chat messages are not read as answers.
+	// Guarded by the owning interactiveState's mu.
+	CardAnswerOnly bool
+	Resolved       chan struct{} // closed when user responds
+	resolveOnce    sync.Once
 }
 
 func (s *interactiveState) stopSignal() <-chan struct{} {
@@ -3459,7 +3463,11 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	queuedKey := MsgMessageQueued
+	if state.pending != nil && state.pending.CardAnswerOnly {
+		queuedKey = MsgMessageQueuedQuestionOpen
+	}
+	e.reply(p, msg.ReplyCtx, e.i18n.T(queuedKey))
 	return true
 }
 
@@ -3616,7 +3624,7 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 		// question was answered some other way (e.g. by a chat message), or
 		// after a restart: forwarding "askq:0:1" as user input would queue
 		// it for the agent as literal text.
-		if _, _, ok := parseAskQuestionCallback(content); ok {
+		if _, _, ok := parseAskQuestionCallback(content); ok || msg.IsAskQuestionAnswer {
 			e.dropStaleAskQuestionCallback(p, msg, content)
 			return true
 		}
@@ -3624,10 +3632,11 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	}
 found:
 
-	// An option click from an AskUserQuestion card is never a permission
-	// decision, and a click on an earlier question's card must not answer
-	// the question being asked now.
-	if qIdx, hasQIdx, ok := parseAskQuestionCallback(content); ok {
+	// An answer from an AskUserQuestion card is never a permission decision,
+	// and a tap on an earlier question's card must not answer the question
+	// being asked now.
+	qIdx, hasQIdx, isOptionTap := parseAskQuestionCallback(content)
+	if isOptionTap || msg.IsAskQuestionAnswer {
 		if len(pending.Questions) == 0 || (hasQIdx && qIdx != pending.CurrentQuestion) {
 			e.dropStaleAskQuestionCallback(p, msg, content)
 			return true
@@ -3644,6 +3653,18 @@ found:
 			return false
 		}
 
+		// When the question went out as a card with its own answer box, only
+		// an answer given in that card counts. A chat message sent meanwhile
+		// may be about something else entirely (a reply to an earlier message,
+		// a new instruction), so it takes the normal path instead of being
+		// read as the answer.
+		state.mu.Lock()
+		cardAnswerOnly := pending.CardAnswerOnly
+		state.mu.Unlock()
+		if cardAnswerOnly && !isOptionTap && !msg.IsAskQuestionAnswer {
+			return false
+		}
+
 		curIdx := pending.CurrentQuestion
 		q := pending.Questions[curIdx]
 		answer := e.resolveAskQuestionAnswer(q, content)
@@ -3657,7 +3678,10 @@ found:
 		if curIdx+1 < len(pending.Questions) {
 			pending.CurrentQuestion = curIdx + 1
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
-			e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1)
+			cardAnswerOnly := e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1)
+			state.mu.Lock()
+			pending.CardAnswerOnly = cardAnswerOnly
+			state.mu.Unlock()
 			return true
 		}
 
@@ -5965,7 +5989,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Unlock()
 
 			if isAskQuestion {
-				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				cardAnswerOnly := e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				state.mu.Lock()
+				pending.CardAnswerOnly = cardAnswerOnly
+				state.mu.Unlock()
 			} else {
 				permLimit := e.display.ToolMaxLen
 				if permLimit > 0 {
@@ -12212,8 +12239,10 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 }
 
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.
-// qIdx is the 0-based index of the question to display.
-func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int) {
+// qIdx is the 0-based index of the question to display. It reports whether the
+// question went out as a card with its own answer box, in which case only
+// answers given in that card should resolve it.
+func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int) (cardAnswerOnly bool) {
 	if qIdx >= len(questions) {
 		return
 	}
@@ -12249,7 +12278,7 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 				TooLongNotice:    e.i18n.T(MsgAskqCardTooLong),
 			}, q, qIdx)
 			if err == nil {
-				return
+				return true
 			}
 			slog.Debug("sendAskQuestionPrompt: native card unavailable, falling back",
 				"platform", p.Name(), "error", err)
@@ -12373,6 +12402,7 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	}
 	sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgAskQuestionNote)))
 	e.send(p, replyCtx, sb.String())
+	return false
 }
 
 // waitOutgoing blocks on the per-platform outgoing rate limiter when enabled.

@@ -209,6 +209,7 @@ const (
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
+	MsgMessageQueuedQuestionOpen MsgKey = "message_queued_question_open"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
 	MsgCurrentSession            MsgKey = "current_session"
@@ -804,6 +805,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
 		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
 		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
+	},
+	MsgMessageQueuedQuestionOpen: {
+		LangEnglish:            "📬 Message received. It was not taken as the answer to the question card above: answer there by tapping an option or typing in its box. This message will be handled after the current task; to tell the agent now, send /ps <text>.",
+		LangChinese:            "📬 消息已收到，但没有当作上面问题卡片的回答：请在卡片里点选项或在输入框里填写。这条消息会在当前任务结束后处理；想现在就告诉 agent，发 /ps 内容。",
+		LangTraditionalChinese: "📬 訊息已收到，但沒有當作上面問題卡片的回答：請在卡片裡點選項或在輸入框裡填寫。這則訊息會在目前任務結束後處理；想現在就告訴 agent，傳 /ps 內容。",
+		LangJapanese:           "📬 メッセージを受け取りましたが、上の質問カードへの回答としては扱っていません。カードで選択肢を押すか入力欄に回答してください。このメッセージは現在のタスク終了後に処理します。今すぐエージェントに伝えるには /ps <内容> を送ってください。",
+		LangSpanish:            "📬 Mensaje recibido. No se tomó como respuesta a la tarjeta de pregunta de arriba: responde allí pulsando una opción o escribiendo en su cuadro. Este mensaje se procesará cuando termine la tarea actual; para decírselo al agente ahora, envía /ps <texto>.",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",
@@ -2803,11 +2811,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Responda con los números de opción separados por comas (ej. 1,3) o escriba su respuesta",
 	},
 	MsgAskQuestionNoteFreeform: {
-		LangEnglish:            "None of the options fit? Type your answer in the input box below — it is passed back to the agent as-is",
-		LangChinese:            "选项不合适？直接在下方输入框输入你的想法，会原样作为回答传回",
-		LangTraditionalChinese: "選項不合適？直接在下方輸入框輸入你的想法，會原樣作為回答傳回",
-		LangJapanese:           "選択肢が合わない場合は、下の入力欄に直接回答を入力してください（そのまま agent に渡されます）",
-		LangSpanish:            "¿Ninguna opción encaja? Escribe tu respuesta en el cuadro de abajo; se pasa al agente tal cual",
+		LangEnglish:            "None of the options fit? Type your answer in the input box below — it is passed back to the agent as-is. Messages sent in the chat are not taken as the answer",
+		LangChinese:            "选项不合适？直接在下方输入框输入你的想法，会原样作为回答传回。在聊天框里发的消息不会当作回答",
+		LangTraditionalChinese: "選項不合適？直接在下方輸入框輸入你的想法，會原樣作為回答傳回。在聊天框裡發的訊息不會當作回答",
+		LangJapanese:           "選択肢が合わない場合は、下の入力欄に直接回答を入力してください（そのまま agent に渡されます）。チャットに送ったメッセージは回答として扱われません",
+		LangSpanish:            "¿Ninguna opción encaja? Escribe tu respuesta en el cuadro de abajo; se pasa al agente tal cual. Los mensajes enviados en el chat no se toman como respuesta",
 	},
 	MsgAskQuestionFreeformPlaceholder: {
 		LangEnglish:            "Type your answer…",

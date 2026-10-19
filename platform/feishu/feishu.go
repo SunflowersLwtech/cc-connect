@@ -1005,6 +1005,8 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 				ChatName:   p.resolveChatName(chatID),
 				Content:    answer,
 				ReplyCtx:   rctx,
+
+				IsAskQuestionAnswer: true,
 			})
 
 			title := answer
@@ -1036,6 +1038,8 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			ChatName:   p.resolveChatName(chatID),
 			Content:    actionVal,
 			ReplyCtx:   rctx,
+
+			IsAskQuestionAnswer: true,
 		})
 
 		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
