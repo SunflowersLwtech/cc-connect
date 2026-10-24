@@ -490,3 +490,44 @@ func TestQueuedTurn_BufferedPermissionRequestIsAnswered(t *testing.T) {
 		})
 	}
 }
+
+// Each buffered turn is sent on its own; text does not carry over to the next.
+func TestQueuedTurn_ConsecutiveBufferedTurnsDoNotShareText(t *testing.T) {
+	p, _ := runQueuedTurnWithBuffer(t, []Event{
+		{Type: EventText, Content: "one"},
+		{Type: EventResult, Done: true},
+		{Type: EventText, Content: "two"},
+		{Type: EventResult, Done: true},
+	})
+	assertLines(t, "platform sends", recordedSends(p), []string{
+		"ctx-turn1: reply1", "ctx-turn1: one", "ctx-turn1: two", "ctx-msg2: reply2",
+	})
+}
+
+// A long background reply is split to the platform's message limit.
+func TestUnsolicitedReader_SplitsLongReply(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("reader-long")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	key := "test:ch1:u1"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+	e.startUnsolicitedReader(state, session, e.sessions, key, "")
+	defer e.stopUnsolicitedReader(state)
+
+	long := strings.Repeat("line of background output\n", 400) // ~10k chars
+	sess.events <- Event{Type: EventResult, Content: long, Done: true}
+	sent := waitForPlatformSend(p, 2, 2*time.Second)
+	if len(sent) < 2 {
+		t.Fatalf("want the long reply split, got %d sends", len(sent))
+	}
+	for _, s := range sent {
+		if len(s) > maxPlatformMessageLen {
+			t.Fatalf("sent a %d-char message, limit %d (%d sends)", len(s), maxPlatformMessageLen, len(sent))
+		}
+	}
+}
