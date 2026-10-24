@@ -6229,6 +6229,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
+			if event.UsageLimit != nil {
+				e.reportUsageLimit(p, sessionKey, msgID, event)
+				if e.usageLimitReply != "" {
+					fullResponse = e.usageLimitReply
+				}
+			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
 			// leak into the delivered text. The on-screen ctx indicator is now
