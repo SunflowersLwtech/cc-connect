@@ -511,6 +511,10 @@ type ProjectConfig struct {
 	// "notify" (default) tells the user and offers the ways back; "restore"
 	// also switches the session back once that turn's reply is out.
 	ModelFallbackAction string `toml:"model_fallback_action,omitempty"`
+	// UsageLimitReply, when set, is sent instead of the agent's refusal text
+	// when a turn is refused because a usage limit has been reached (the
+	// turn.usage_limited hook still fires either way).
+	UsageLimitReply string `toml:"usage_limit_reply,omitempty"`
 	// AgentSessionIdleTimeoutMins 在指定分钟数后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下一条消息继续恢复。0 或 nil 表示禁用。
 	AgentSessionIdleTimeoutMins *int `toml:"agent_session_idle_timeout_mins,omitempty"`

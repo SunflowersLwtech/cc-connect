@@ -452,6 +452,10 @@ type Engine struct {
 	modelFallbackAction    string
 	modelRestoreLoopWindow time.Duration
 
+	// usageLimitReply replaces the agent's refusal text when a turn is
+	// refused for a usage limit (empty: send the agent's text).
+	usageLimitReply string
+
 	// Reply footer composition flags. The footer renders up to two lines:
 	//   line 1 — model · [effort ·] out/in/cw/cr · ctx%   (gated by showContextIndicator)
 	//   line 2 — workspace directory                       (gated by showWorkdirIndicator)
@@ -1023,6 +1027,33 @@ func (e *Engine) SetModelFallbackAction(action string) {
 		return
 	}
 	e.modelFallbackAction = ModelFallbackNotify
+}
+
+// reportUsageLimit emits turn.usage_limited for a turn the provider refused,
+// so a hook can hand the user's message to someone who can still answer it.
+// Extra: in_reply_to (the user message that started the turn), prompt (as the
+// agent was sent it, attachment paths included), limit_text, resets_at, and
+// reply (the configured text the user got instead, when set).
+func (e *Engine) reportUsageLimit(p Platform, sessionKey, msgID string, event Event) {
+	extra := map[string]any{"limit_text": event.Content, "prompt": event.UsageLimit.Prompt}
+	if msgID != "" {
+		extra["in_reply_to"] = msgID
+	}
+	if !event.UsageLimit.ResetsAt.IsZero() {
+		extra["resets_at"] = event.UsageLimit.ResetsAt.UTC().Format(time.RFC3339)
+	}
+	if e.usageLimitReply != "" {
+		extra["reply"] = e.usageLimitReply // what the user was told instead
+	}
+	slog.Warn("turn refused for a usage limit", "session", sessionKey, "msg_id", msgID, "resets_at", extra["resets_at"])
+	e.hooks.Emit(HookEvent{Event: HookEventUsageLimited, SessionKey: sessionKey, Platform: p.Name(), Extra: extra})
+}
+
+// SetUsageLimitReply sets the text sent instead of the agent's refusal when a
+// turn is refused because a usage limit has been reached; empty keeps the
+// agent's own text.
+func (e *Engine) SetUsageLimitReply(text string) {
+	e.usageLimitReply = strings.TrimSpace(text)
 }
 
 func (e *Engine) modelRestoreWindow() time.Duration {
@@ -6221,6 +6252,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
+			}
+			if event.UsageLimit != nil {
+				e.reportUsageLimit(p, sessionKey, msgID, event)
+				if e.usageLimitReply != "" {
+					fullResponse = e.usageLimitReply
+				}
 			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
