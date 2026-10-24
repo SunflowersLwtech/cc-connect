@@ -111,6 +111,10 @@ type replyContext struct {
 	chatID          string
 	sessionKey      string
 	bootstrapThread bool
+	// As received on the inbound message, for core.Message (not used to reply).
+	parentID string
+	rootID   string
+	threadID string
 }
 
 type Platform struct {
@@ -122,6 +126,7 @@ type Platform struct {
 	progressStyle              string
 	useInteractiveCard         bool
 	self                       core.Platform
+	deliveryObserver           func(core.DeliveredMessage) // guarded by mu
 	reactionEmoji              string
 	doneEmoji                  string
 	allowFrom                  string
@@ -1196,6 +1201,9 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		return
 	}
 	p.populateWorkspaceChannelKeys(msg)
+	if rc, ok := msg.ReplyCtx.(replyContext); ok && msg.ReplyToMessageID == "" && msg.ThreadRootID == "" && msg.PlatformThreadID == "" {
+		msg.ReplyToMessageID, msg.ThreadRootID, msg.PlatformThreadID = rc.parentID, rc.rootID, rc.threadID
+	}
 	if p.isMessageRecalled(msg.MessageID) {
 		slog.Debug(p.tag()+": recalled message dispatch dropped", "message_id", msg.MessageID)
 		return
@@ -1556,7 +1564,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := replyContext{
+		messageID: messageID, chatID: chatID, sessionKey: sessionKey,
+		parentID: parentID, rootID: stringValue(msg.RootId), threadID: stringValue(msg.ThreadId),
+	}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -3165,7 +3176,7 @@ func (p *Platform) sendMediaMessage(ctx context.Context, rc replyContext, msgTyp
 	if p.shouldUseThreadOrReplyAPI(rc) {
 		return p.replyMessage(ctx, rc, msgType, content)
 	}
-	return p.createMessage(ctx, rc.chatID, msgType, content, "send media message")
+	return p.createMessage(ctx, rc, msgType, content, "send media message")
 }
 
 func detectFeishuFileType(mimeType, fileName string) string {
@@ -3836,7 +3847,7 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 	if rc.chatID == "" {
 		return fmt.Errorf("%s: chatID is empty, cannot send new message", p.tag())
 	}
-	return p.createMessage(ctx, rc.chatID, msgType, content, "send")
+	return p.createMessage(ctx, rc, msgType, content, "send")
 }
 
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
@@ -3848,6 +3859,25 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 		body.ReplyInThread(true)
 	}
 	return body.Build()
+}
+
+// SetDeliveryObserver implements core.DeliveryReporter.
+func (p *Platform) SetDeliveryObserver(fn func(core.DeliveredMessage)) {
+	p.mu.Lock()
+	p.deliveryObserver = fn
+	p.mu.Unlock()
+}
+
+// reportDeliveredID tells the observer that messageID now exists in rc's chat,
+// sent in answer to rc's user message.
+func (p *Platform) reportDeliveredID(rc replyContext, messageID string) {
+	p.mu.RLock()
+	fn := p.deliveryObserver
+	p.mu.RUnlock()
+	if fn == nil || messageID == "" {
+		return
+	}
+	fn(core.DeliveredMessage{MessageID: messageID, InReplyTo: rc.messageID, ChatID: rc.chatID})
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
@@ -3864,16 +3894,19 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				p.reportDeliveredID(rc, *resp.Data.MessageId)
+			}
 			return nil
 		})
 	})
 }
 
-func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+func (p *Platform) createMessage(ctx context.Context, rc replyContext, msgType, content, op string) error {
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(chatID).
+			ReceiveId(rc.chatID).
 			MsgType(msgType).
 			Content(content).
 			Uuid(newMessageUUID()).
@@ -3887,6 +3920,9 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			}
 			if !resp.Success() {
 				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
+			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				p.reportDeliveredID(rc, *resp.Data.MessageId)
 			}
 			return nil
 		})
@@ -4962,6 +4998,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	if msgID == "" {
 		return nil, fmt.Errorf("%s: send preview: no message ID returned", p.tag())
 	}
+	p.reportDeliveredID(rc, msgID)
 
 	return &feishuPreviewHandle{messageID: msgID, chatID: chatID, cardID: cardID}, nil
 }

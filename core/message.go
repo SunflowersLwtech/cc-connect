@@ -421,6 +421,13 @@ type Message struct {
 	ExtraContent string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
 	OnAccepted   func()              // called once when the engine accepts this message for an agent turn
 	ChannelKey   string              // platform-provided channel identifier for workspace binding (optional)
+	// ReplyToMessageID is the platform ID of the message the user replied to
+	// (Feishu parent_id); empty for a message that replies to nothing.
+	ReplyToMessageID string
+	// ThreadRootID is the first message of the reply chain (Feishu root_id).
+	ThreadRootID string
+	// PlatformThreadID is the topic ID the platform itself assigns (Feishu thread_id).
+	PlatformThreadID string
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace
 	// routing atomically migrates the legacy binding to ChannelKey.

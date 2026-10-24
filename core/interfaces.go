@@ -252,6 +252,21 @@ type StatusFooterSender interface {
 	SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
 }
 
+// DeliveredMessage describes one message a platform has just created in a chat.
+type DeliveredMessage struct {
+	MessageID string // platform ID of the new message
+	InReplyTo string // ID of the user message this output answers; empty when unknown
+	ChatID    string
+}
+
+// DeliveryReporter is an optional interface for platforms that can report the
+// IDs of the messages they send. The engine passes a function that turns each
+// report into a message.delivered hook event, so a user who later replies to
+// one of those messages can be matched back to the turn that produced it.
+type DeliveryReporter interface {
+	SetDeliveryObserver(fn func(DeliveredMessage))
+}
+
 // StatusFooterUpdater is the streaming-preview counterpart of
 // StatusFooterSender: it patches an existing preview message with a final
 // content + structured status footer block.

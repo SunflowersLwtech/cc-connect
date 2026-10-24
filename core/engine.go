@@ -2405,6 +2405,12 @@ func (e *Engine) Start() error {
 		if async, ok := p.(AsyncRecoverablePlatform); ok {
 			async.SetLifecycleHandler(e)
 		}
+		if r, ok := p.(DeliveryReporter); ok {
+			name := p.Name()
+			r.SetDeliveryObserver(func(d DeliveredMessage) {
+				e.hooks.Emit(deliveredHookEvent(name, d))
+			})
+		}
 		if err := p.Start(e.handleMessage); err != nil {
 			slog.Warn("platform start failed", "project", e.name, "platform", p.Name(), "error", err)
 			startErrs = append(startErrs, fmt.Errorf("[%s] start platform %s: %w", e.name, p.Name(), err))
@@ -3028,6 +3034,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		)
 	}
 
+	// Emitted before any routing (queue, /ps, pending question, stale drop),
+	// so a message sent while the agent is busy is reported too. Content is
+	// the user's own text; a quoted message is still in ExtraContent here.
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventMessageReceived,
 		SessionKey: msg.SessionKey,
@@ -3035,6 +3044,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		UserID:     msg.UserID,
 		UserName:   msg.UserName,
 		Content:    msg.Content,
+		Extra:      receivedHookExtra(msg, msg.Audio != nil && e.speech.Enabled && e.speech.STT != nil),
 	})
 
 	// Voice message: transcribe to text first
@@ -6346,6 +6356,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					SessionKey: sessionKey,
 					Platform:   p.Name(),
 					Content:    baseResponse,
+					Extra:      sentHookExtra(msgID),
 				})
 			}
 
@@ -6865,6 +6876,7 @@ channelClosed:
 			SessionKey: sessionKey,
 			Platform:   p.Name(),
 			Content:    fullResponse,
+			Extra:      sentHookExtra(msgID),
 		})
 
 		if toolCount > 0 && segmentStart > 0 {

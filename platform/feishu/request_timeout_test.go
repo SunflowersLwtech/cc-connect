@@ -273,7 +273,7 @@ func TestMessageSends_CarryDistinctUUIDs(t *testing.T) {
 	if err := p.replyMessage(ctx, testReplyCtx, "text", `{"text":"two"}`); err != nil {
 		t.Fatalf("reply: %v", err)
 	}
-	if err := p.createMessage(ctx, "oc_chat", "text", `{"text":"three"}`, "send"); err != nil {
+	if err := p.createMessage(ctx, replyContext{chatID: "oc_chat"}, "text", `{"text":"three"}`, "send"); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	if _, err := p.SendPreviewStart(ctx, testReplyCtx, "thinking"); err != nil {
