@@ -351,3 +351,52 @@ func TestQueuedTurn_BufferedTurnModelFallbackRestoredBeforeQueuedMessage(t *test
 		t.Fatalf("switched back with %d messages out, want 3 (after the buffered turn's reply)", sentBefore[0])
 	}
 }
+
+// Background turns follow the foreground NO_REPLY rule: a bare marker sends
+// nothing, a trailing one is cut off; the history keeps what the agent said.
+func TestQueuedTurn_BufferedNoReplyTurnStaysSilent(t *testing.T) {
+	p, session := runQueuedTurnWithBuffer(t, []Event{
+		{Type: EventText, Content: "NO_REPLY"},
+		{Type: EventResult, Content: "NO_REPLY", Done: true},
+		{Type: EventText, Content: "checked the deploy, all green\n\nNO_REPLY"},
+		{Type: EventResult, Done: true},
+	})
+	assertLines(t, "platform sends", recordedSends(p), []string{
+		"ctx-turn1: reply1",
+		"ctx-turn1: checked the deploy, all green",
+		"ctx-msg2: reply2",
+	})
+	assertLines(t, "history", historyLines(session), []string{
+		"user: msg1",
+		"assistant: reply1",
+		"assistant: NO_REPLY",
+		"assistant: checked the deploy, all green\n\nNO_REPLY",
+		"user: msg2",
+		"assistant: reply2",
+	})
+}
+
+// The unsolicited reader shares the delivery, so the same rule applies there.
+func TestUnsolicitedReader_NoReplyTurnStaysSilent(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("reader-noreply")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	key := "test:ch1:u1"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+	e.startUnsolicitedReader(state, session, e.sessions, key, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventResult, Content: "NO_REPLY", Done: true}
+	sess.events <- Event{Type: EventResult, Content: "background check done", Done: true}
+	sent := waitForPlatformSend(p, 1, 2*time.Second)
+	assertLines(t, "platform sends", sent, []string{"background check done"})
+	assertLines(t, "history", historyLines(session), []string{
+		"assistant: NO_REPLY",
+		"assistant: background check done",
+	})
+}
