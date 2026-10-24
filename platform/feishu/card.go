@@ -71,7 +71,7 @@ func (p *interactivePlatform) RefreshCard(ctx context.Context, sessionKey string
 			Content(cardJSON).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, "refresh card", func() error {
+	return p.withAttemptRetry(ctx, "refresh card", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "refresh card", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Patch(ctx, req, options...)
 			if err != nil {
