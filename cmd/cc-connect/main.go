@@ -717,6 +717,7 @@ func main() {
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		engine.SetModelFallbackAction(proj.ModelFallbackAction)
+		engine.SetUsageLimitReply(proj.UsageLimitReply)
 		if defaulted {
 			slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 				"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
@@ -1802,6 +1803,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	engine.SetModelFallbackAction(proj.ModelFallbackAction)
+	engine.SetUsageLimitReply(proj.UsageLimitReply)
 	if defaulted {
 		slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 			"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
