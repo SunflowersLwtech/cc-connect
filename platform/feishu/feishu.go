@@ -467,7 +467,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 	encryptKey, _ := opts["encrypt_key"].(string)
 
-	var clientOpts []lark.ClientOptionFunc
+	clientOpts := []lark.ClientOptionFunc{lark.WithHttpClient(newFeishuHTTPClient())}
 	if domain != lark.FeishuBaseUrl {
 		clientOpts = append(clientOpts, lark.WithOpenBaseUrl(domain))
 	}
@@ -1005,7 +1005,9 @@ func (p *Platform) addReaction(messageID string) string {
 }
 
 func (p *Platform) addReactionWithEmoji(messageID, emojiType string) string {
-	return p.addReactionWithEmojiContext(context.Background(), messageID, emojiType)
+	ctx, cancel := context.WithTimeout(context.Background(), feishuAttemptTimeout)
+	defer cancel()
+	return p.addReactionWithEmojiContext(ctx, messageID, emojiType)
 }
 
 func (p *Platform) addReactionWithEmojiContext(ctx context.Context, messageID, emojiType string) string {
@@ -1037,7 +1039,9 @@ func (p *Platform) removeReaction(messageID, reactionID string) {
 	if reactionID == "" || messageID == "" {
 		return
 	}
-	resp, err := p.client.Im.MessageReaction.Delete(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), feishuAttemptTimeout)
+	defer cancel()
+	resp, err := p.client.Im.MessageReaction.Delete(ctx,
 		larkim.NewDeleteMessageReactionReqBuilder().
 			MessageId(messageID).
 			ReactionId(reactionID).
@@ -4206,7 +4210,8 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
-		Content(content)
+		Content(content).
+		Uuid(newMessageUUID())
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
@@ -4218,7 +4223,7 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	return p.withTransientRetry(ctx, "reply", func() error {
+	return p.withAttemptRetry(ctx, "reply", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -4239,9 +4244,10 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			ReceiveId(chatID).
 			MsgType(msgType).
 			Content(content).
+			Uuid(newMessageUUID()).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, op, func() error {
+	return p.withAttemptRetry(ctx, op, func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Create(ctx, req, options...)
 			if err != nil {
@@ -4298,7 +4304,7 @@ func (p *Platform) replayAPIClient() *lark.Client {
 
 func newFeishuReplayClient(appID, appSecret, domain string) *lark.Client {
 	var opts []lark.ClientOptionFunc
-	opts = append(opts, lark.WithEnableTokenCache(false))
+	opts = append(opts, lark.WithEnableTokenCache(false), lark.WithHttpClient(newFeishuHTTPClient()))
 	if domain != "" && domain != lark.FeishuBaseUrl {
 		opts = append(opts, lark.WithOpenBaseUrl(domain))
 	}
@@ -4341,6 +4347,10 @@ func isTransientError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+	// An attempt that hit its own deadline (see withAttemptTimeout).
+	if errors.Is(err, errFeishuAttemptTimeout) {
+		return true
+	}
 	// Unwrapped string checks for common transient symptoms that may
 	// appear in wrapped Feishu SDK errors.
 	msg := err.Error()
@@ -4351,6 +4361,7 @@ func isTransientError(err error) bool {
 		"TLS handshake timeout",
 		"server misbehaving",
 		"connection refused",
+		"http2: client connection lost", // HTTP/2 health check gave up on the connection
 	} {
 		if strings.Contains(msg, substr) {
 			return true
@@ -5294,7 +5305,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
 			Build()
 		var resp *larkim.ReplyMessageResp
-		if err := p.withTransientRetry(ctx, "send preview", func() error {
+		if err := p.withAttemptRetry(ctx, "send preview", func(ctx context.Context) error {
 			return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 				var err error
 				resp, err = client.Im.Message.Reply(ctx, req, options...)
@@ -5319,10 +5330,11 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 				ReceiveId(chatID).
 				MsgType(larkim.MsgTypeInteractive).
 				Content(sendContent).
+				Uuid(newMessageUUID()).
 				Build()).
 			Build()
 		var resp *larkim.CreateMessageResp
-		if err := p.withTransientRetry(ctx, "send preview", func() error {
+		if err := p.withAttemptRetry(ctx, "send preview", func(ctx context.Context) error {
 			return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 				var err error
 				resp, err = client.Im.Message.Create(ctx, req, options...)
@@ -5531,7 +5543,7 @@ func (p *Platform) patchCardMessage(ctx context.Context, messageID, cardJSON str
 			Content(cardJSON).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, "patch message", func() error {
+	return p.withAttemptRetry(ctx, "patch message", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "patch message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Patch(ctx, req, options...)
 			if err != nil {
@@ -5641,7 +5653,7 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 	req := larkim.NewDeleteMessageReqBuilder().
 		MessageId(h.messageID).
 		Build()
-	return p.withTransientRetry(ctx, "delete preview message", func() error {
+	return p.withAttemptRetry(ctx, "delete preview message", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "delete preview message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Delete(ctx, req, options...)
 			if err != nil {
