@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -399,4 +400,93 @@ func TestUnsolicitedReader_NoReplyTurnStaysSilent(t *testing.T) {
 		"assistant: NO_REPLY",
 		"assistant: background check done",
 	})
+}
+
+type permAnsweringSession struct {
+	*queuingAgentSession
+	mu      sync.Mutex
+	answers []string
+}
+
+// RespondPermission records the answer and how many prompts the agent had
+// been sent at that point.
+func (s *permAnsweringSession) RespondPermission(id string, r PermissionResult) error {
+	s.sendMu.Lock()
+	before := len(s.sendCalls)
+	s.sendMu.Unlock()
+	s.mu.Lock()
+	s.answers = append(s.answers, fmt.Sprintf("%s:%s after %d sends", id, r.Behavior, before))
+	s.mu.Unlock()
+	return nil
+}
+
+// A background turn stopped at a permission request is answered before the
+// queued message goes out, instead of being dropped and leaving the agent
+// blocked until the idle timeout.
+func TestQueuedTurn_BufferedPermissionRequestIsAnswered(t *testing.T) {
+	notice := func(tool string) string {
+		return "ctx-turn1: " + fmt.Sprintf(NewI18n(LangEnglish).T(MsgBackgroundAutoDenied), tool)
+	}
+	cases := []struct {
+		name       string
+		tool       string
+		yolo       bool
+		wantAnswer string
+		wantSends  []string
+	}{
+		{"question, nobody to ask", "AskUserQuestion", false, "rq1:deny after 0 sends",
+			[]string{"ctx-turn1: reply1", notice("AskUserQuestion"), "ctx-msg2: reply2"}},
+		{"question under /yolo is still denied", "AskUserQuestion", true, "rq1:deny after 0 sends",
+			[]string{"ctx-turn1: reply1", notice("AskUserQuestion"), "ctx-msg2: reply2"}},
+		{"tool, nobody to ask", "Bash", false, "rq1:deny after 0 sends",
+			[]string{"ctx-turn1: reply1", notice("Bash"), "ctx-msg2: reply2"}},
+		{"tool under /yolo", "Bash", true, "rq1:allow after 0 sends",
+			[]string{"ctx-turn1: reply1", "ctx-msg2: reply2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &replyCtxRecordingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+			sess := &permAnsweringSession{queuingAgentSession: newQueuingSession("buffered-perm")}
+			e := NewEngine("test", &controllableAgent{nextSession: sess}, []Platform{p}, "", LangEnglish)
+			t.Cleanup(func() { _ = e.Stop() })
+			key := "test:user1"
+			session := e.sessions.GetOrCreateActive(key)
+			state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx-turn1", approveAll: tc.yolo,
+				pendingMessages: []queuedMessage{{platform: p, replyCtx: "ctx-msg2", content: "msg2"}}}
+			e.interactiveMu.Lock()
+			e.interactiveStates[key] = state
+			e.interactiveMu.Unlock()
+
+			sess.events <- Event{Type: EventResult, Content: "reply1", Done: true}
+			sess.events <- Event{Type: EventText, Content: "background: which one?"}
+			ev := Event{Type: EventPermissionRequest, ToolName: tc.tool, RequestID: "rq1"}
+			if tc.tool == "AskUserQuestion" {
+				ev.Questions = []UserQuestion{{Question: "A or B?", Options: []UserQuestionOption{{Label: "A"}, {Label: "B"}}}}
+			}
+			sess.events <- ev
+			go func() {
+				if waitQueuingSends(sess.queuingAgentSession, 1) {
+					sess.events <- Event{Type: EventResult, Content: "reply2", Done: true}
+				}
+			}()
+			sendDone := make(chan error, 1)
+			sendDone <- nil
+			done := make(chan struct{})
+			go func() {
+				e.processInteractiveEvents(state, session, e.sessions, key, "m1", time.Now(), nil, sendDone, "ctx-turn1", 0)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("did not complete; sent %q", recordedSends(p))
+			}
+
+			sess.mu.Lock()
+			answers := append([]string(nil), sess.answers...)
+			sess.mu.Unlock()
+			assertLines(t, "answers to the agent", answers, []string{tc.wantAnswer})
+			assertLines(t, "platform sends", recordedSends(p), tc.wantSends)
+		})
+	}
 }

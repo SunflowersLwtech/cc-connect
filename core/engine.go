@@ -12612,7 +12612,9 @@ func drainEvents(ch <-chan Event) {
 // events until the next turn starts. drainEvents threw that reply away. Here
 // every turn that is complete in the buffer, i.e. ends in a terminal
 // EventResult, is delivered the way the unsolicited reader delivers one, and
-// model switch notices are relayed. Everything else is discarded as before:
+// model switch notices are relayed. A turn stopped at a permission request is
+// answered, so the agent does not stay blocked behind the queued message.
+// Everything else is discarded as before:
 // errors, and the start of a turn the agent is still running (the rest of
 // that turn reaches the next turn's event loop).
 //
@@ -12646,6 +12648,12 @@ func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, se
 				pending = 0
 			case event.Type == EventModelSwitch:
 				e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
+			case event.Type == EventPermissionRequest:
+				// The agent's own turn is waiting for an answer that no one
+				// will give, and the queued message would get no reply until
+				// the idle timeout. Answer it as the unsolicited reader does.
+				e.answerBufferedPermission(state, p, replyCtx, event)
+				pending++
 			case event.Type == EventError:
 				// Whatever came before the error belongs to a turn that
 				// will never complete.
@@ -12661,6 +12669,47 @@ func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, se
 		default:
 			return
 		}
+	}
+}
+
+// bufferedPermissionAnswerWait bounds how long the drain waits for the agent
+// to take a permission answer before the queued message is sent after it.
+const bufferedPermissionAnswerWait = 5 * time.Second
+
+// answerBufferedPermission answers a permission request found in the buffer,
+// where no user turn is there to ask: allowed under /yolo, otherwise denied
+// with a notice to the user. AskUserQuestion is always denied, since
+// approving it would answer nothing.
+func (e *Engine) answerBufferedPermission(state *interactiveState, p Platform, replyCtx any, event Event) {
+	state.mu.Lock()
+	allow := state.approveAll && event.ToolName != "AskUserQuestion"
+	agentSession := state.agentSession
+	state.mu.Unlock()
+
+	result := PermissionResult{Behavior: "deny", Message: "denied: no active user turn"}
+	if allow {
+		result = PermissionResult{Behavior: "allow", UpdatedInput: event.ToolInputRaw}
+	}
+	if agentSession != nil {
+		answered := make(chan struct{})
+		go func() {
+			defer close(answered)
+			if err := agentSession.RespondPermission(event.RequestID, result); err != nil {
+				slog.Error("buffered permission: failed to respond", "request", event.RequestID, "error", err)
+			}
+		}()
+		select {
+		case <-answered:
+		case <-time.After(bufferedPermissionAnswerWait):
+			slog.Warn("buffered permission: answer still pending", "request", event.RequestID)
+		}
+	}
+	if !allow {
+		toolName := event.ToolName
+		if toolName == "" {
+			toolName = "(unknown)"
+		}
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgBackgroundAutoDenied), toolName))
 	}
 }
 
