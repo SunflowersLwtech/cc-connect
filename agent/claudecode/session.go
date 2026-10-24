@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,6 +50,15 @@ type claudeSession struct {
 	// carried a model field yet; callers should fall back to the Agent's
 	// configured model.
 	activeModel atomic.Value // stores string
+	// lastModelSwitch remembers the last model_refusal_fallback that was
+	// reported, so a fallback the CLI announces twice (provisional, then final)
+	// reaches the user once.
+	lastModelSwitch atomic.Value // stores string
+
+	// controlWaiters routes the CLI's control_response for a control_request
+	// cc-connect sent (set_model) back to the caller, keyed by request_id.
+	controlMu      sync.Mutex
+	controlWaiters map[string]chan map[string]any
 
 	// usageMu guards lastUsage. Populated from the most recent result event.
 	usageMu   sync.Mutex
@@ -646,6 +657,8 @@ func (cs *claudeSession) handleReadLoopLine(line string) {
 		cs.handleResult(raw)
 	case "control_request":
 		cs.handleControlRequest(raw)
+	case "control_response":
+		cs.handleControlResponse(raw)
 	case "control_cancel_request":
 		requestID, _ := raw["request_id"].(string)
 		slog.Debug("claudeSession: permission cancelled", "request_id", requestID)
@@ -681,6 +694,9 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 	if model, ok := raw["model"].(string); ok && model != "" {
 		cs.activeModel.Store(model)
 	}
+	if subtype, _ := raw["subtype"].(string); subtype == "model_refusal_fallback" {
+		cs.handleRefusalFallback(raw)
+	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
 		evt := core.Event{Type: core.EventText, SessionID: sid}
@@ -707,6 +723,63 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 			cs.usageMu.Unlock()
 		}
 	})
+}
+
+// handleRefusalFallback handles Claude Code's model_refusal_fallback event:
+// the primary model's safeguards declined a request and the CLI re-ran it on a
+// fallback model (claude-opus-5-5 falls back to claude-opus-4-8 for the "cyber"
+// category, for example). With scope "session", or no scope from older CLIs,
+// the CLI keeps the rest of the session on the fallback model until a model is
+// picked again, so the active model follows it; the reply footer would
+// otherwise keep naming a model that no longer answers. Scope "local" means
+// only a subagent's or side question's response came from the fallback model.
+//
+// The CLI may announce one fallback twice (a provisional notice mid-turn and
+// the final one at the end of the turn), so it is reported once per refused
+// request and fallback target.
+func (cs *claudeSession) handleRefusalFallback(raw map[string]any) {
+	// "revert" and "sticky" are still in the CLI's enum for SDK compatibility
+	// but are no longer emitted; only a retry moves the turn to another model.
+	if direction, _ := raw["direction"].(string); direction != "" && direction != "retry" {
+		slog.Debug("claudeSession: ignoring model_refusal_fallback", "direction", direction)
+		return
+	}
+	from, _ := raw["original_model"].(string)
+	to, _ := raw["fallback_model"].(string)
+	if from == "" || to == "" {
+		return
+	}
+	scope, _ := raw["scope"].(string)
+	sessionWide := scope != "local"
+	category, _ := raw["api_refusal_category"].(string)
+	requestID, _ := raw["request_id"].(string)
+
+	key := requestID + "\x00" + from + "\x00" + to
+	if prev, _ := cs.lastModelSwitch.Load().(string); prev == key {
+		return
+	}
+	cs.lastModelSwitch.Store(key)
+
+	if sessionWide {
+		cs.activeModel.Store(to)
+		// The cached window was reported for the previous model; the next
+		// result event reports the fallback model's own.
+		cs.reportedCtxWindow.Store(0)
+	}
+	slog.Warn("claudeSession: safeguards fallback switched model",
+		"from", from, "to", to, "category", category, "scope", scope, "request_id", requestID)
+
+	evt := core.Event{Type: core.EventModelSwitch, ModelSwitch: &core.ModelSwitch{
+		From:        from,
+		To:          to,
+		Reason:      "refusal",
+		Category:    category,
+		SessionWide: sessionWide,
+	}}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+	}
 }
 
 // claudeUsageFromTranscriptLine parses one JSONL transcript line and returns
@@ -1420,6 +1493,82 @@ func (cs *claudeSession) RespondPermission(requestID string, result core.Permiss
 
 	slog.Debug("claudeSession: permission response", "request_id", requestID, "behavior", result.Behavior)
 	return cs.writeJSON(controlResponse)
+}
+
+// SetLiveModel switches the running Claude Code process to model with the
+// set_model control request, so the conversation, the process and its prompt
+// cache stay in place. Claude Code treats it as a model pick: it also ends a
+// safeguards fallback that kept the session on the fallback model. It returns
+// once the CLI acknowledges the request.
+func (cs *claudeSession) SetLiveModel(ctx context.Context, model string) error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("claudecode: set_model %s: session process is not running", model)
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Errorf("claudecode: set_model %s: request id: %w", model, err)
+	}
+	requestID := "cc-connect-set-model-" + hex.EncodeToString(b[:])
+	ch := make(chan map[string]any, 1)
+	cs.controlMu.Lock()
+	if cs.controlWaiters == nil {
+		cs.controlWaiters = make(map[string]chan map[string]any)
+	}
+	cs.controlWaiters[requestID] = ch
+	cs.controlMu.Unlock()
+	defer func() {
+		cs.controlMu.Lock()
+		delete(cs.controlWaiters, requestID)
+		cs.controlMu.Unlock()
+	}()
+
+	if err := cs.writeJSON(map[string]any{
+		"type":       "control_request",
+		"request_id": requestID,
+		"request":    map[string]any{"subtype": "set_model", "model": model},
+	}); err != nil {
+		return fmt.Errorf("claudecode: set_model %s: %w", model, err)
+	}
+
+	select {
+	case resp := <-ch:
+		if subtype, _ := resp["subtype"].(string); subtype != "success" {
+			msg, _ := resp["error"].(string)
+			if msg == "" {
+				msg = "request rejected"
+			}
+			return fmt.Errorf("claudecode: set_model %s: %s", model, msg)
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("claudecode: set_model %s: %w", model, ctx.Err())
+	case <-cs.done:
+		return fmt.Errorf("claudecode: set_model %s: session ended", model)
+	}
+
+	cs.activeModel.Store(model)
+	cs.reportedCtxWindow.Store(0)
+	// A later fallback is a new episode even if it names the same models.
+	cs.lastModelSwitch.Store("")
+	slog.Info("claudeSession: switched model in place", "model", model)
+	return nil
+}
+
+// handleControlResponse delivers the CLI's answer to a control_request that
+// cc-connect sent.
+func (cs *claudeSession) handleControlResponse(raw map[string]any) {
+	resp, _ := raw["response"].(map[string]any)
+	requestID, _ := resp["request_id"].(string)
+	cs.controlMu.Lock()
+	ch := cs.controlWaiters[requestID]
+	cs.controlMu.Unlock()
+	if ch == nil {
+		slog.Debug("claudeSession: control_response without a waiter", "request_id", requestID)
+		return
+	}
+	select {
+	case ch <- resp:
+	default:
+	}
 }
 
 func (cs *claudeSession) writeJSON(v any) error {
