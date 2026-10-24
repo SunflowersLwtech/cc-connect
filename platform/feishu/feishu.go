@@ -1889,13 +1889,28 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 				slog.Warn(p.tag()+": download media thumbnail failed", "error", err)
 			}
 		}
+		// Local patch (same as the upstream PR): also fetch the video itself.
+		var files []core.FileAttachment
+		if mediaBody.FileKey != "" {
+			if videoData, err := p.downloadResource(messageID, mediaBody.FileKey, "file"); err == nil {
+				name := mediaBody.FileName
+				if name == "" {
+					name = "video.mp4"
+				}
+				slog.Info(p.tag()+": media video downloaded", "file_name", name, "size", len(videoData))
+				files = append(files, core.FileAttachment{MimeType: "video/mp4", Data: videoData, FileName: name})
+			} else {
+				slog.Warn(p.tag()+": download media video failed", "error", err)
+				text += " (video download failed; only the cover image is attached)"
+			}
+		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
+			Content: text, ExtraContent: quoted.text, Images: images, Files: files, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
