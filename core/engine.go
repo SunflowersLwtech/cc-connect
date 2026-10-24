@@ -12667,13 +12667,26 @@ func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, se
 // deliverUnsolicitedResult sends the reply of a turn the agent ran on its own
 // and records it in the session history. textParts are the turn's EventText
 // contents, used when the result event carries no text.
+//
+// A NO_REPLY marker is handled as in a foreground turn: a bare marker sends
+// nothing, a trailing one is cut off. History keeps the original text, so the
+// agent still sees that it chose to stay silent.
 func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Session, sessions *SessionManager, result Event, textParts []string) string {
 	fullResponse := result.Content
 	if fullResponse == "" && len(textParts) > 0 {
 		fullResponse = strings.Join(textParts, "")
 	}
-	if fullResponse != "" {
-		for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+	outgoing := fullResponse
+	if isSilentReply(outgoing) {
+		outgoing = ""
+	} else if stripped, ok := stripTrailingSilent(outgoing); ok {
+		outgoing = stripped
+	}
+	if outgoing == "" && fullResponse != "" {
+		slog.Info("silent reply suppressed", "session", session.ID, "unsolicited", true)
+	}
+	if strings.TrimSpace(outgoing) != "" {
+		for _, chunk := range SplitMessageCodeFenceAware(outgoing, maxPlatformMessageLen) {
 			e.send(p, replyCtx, chunk)
 		}
 	}
