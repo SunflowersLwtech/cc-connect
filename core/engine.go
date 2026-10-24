@@ -5171,17 +5171,6 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
 
 			case EventResult:
-				fullResponse := event.Content
-				if fullResponse == "" && len(textParts) > 0 {
-					fullResponse = strings.Join(textParts, "")
-				}
-
-				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-						e.send(p, replyCtx, chunk)
-					}
-				}
-
 				// Safety note: concurrent writes to session.History by the
 				// unsolicited reader and a foreground turn cannot overlap.
 				// Session.AddHistory takes session.mu internally, and
@@ -5189,8 +5178,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
-				session.AddHistory("assistant", fullResponse)
-				sessions.Save()
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, event, textParts)
 
 				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
 
@@ -6659,10 +6647,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// Agent continues working — don't add done reaction for this turn.
 				doneReaction = nil
 
-				// Drain stale events before starting the next turn. Between
-				// EventResult and Send(), the only buffered events would be
-				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
-				drainEvents(state.agentSession.Events())
+				// Clear the buffer before starting the next turn. Besides
+				// stale leftovers (e.g. a deferred EventError from cmd.Wait())
+				// it can hold a turn the agent ran on its own while this
+				// turn's reply was being delivered; that one is relayed to
+				// where this turn's reply went.
+				e.drainBufferedTurns(state.agentSession.Events(), state, session, sessions, sessionKey, p, replyCtx)
 
 				if pendingSend != nil {
 					if err := <-pendingSend; err != nil {
@@ -6991,6 +6981,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 		queued := state.pendingMessages[0]
 		state.pendingMessages = state.pendingMessages[1:]
+		prevPlatform, prevReplyCtx := state.platform, state.replyCtx
+		if prevPlatform == nil {
+			prevPlatform, prevReplyCtx = queued.platform, queued.replyCtx
+		}
 		state.platform = queued.platform
 		state.replyCtx = queued.replyCtx
 		state.currentMessageID = queued.messageID
@@ -7010,7 +7004,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
-		drainEvents(as.Events())
+		e.drainBufferedTurns(as.Events(), state, session, sessions, sessionKey, prevPlatform, prevReplyCtx)
 
 		session.AddHistory("user", queued.content)
 
@@ -11042,11 +11036,15 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	e.stopUnsolicitedReader(state)
 
 	state.mu.Lock()
+	prevPlatform, prevReplyCtx := state.platform, state.replyCtx
+	if prevPlatform == nil {
+		prevPlatform, prevReplyCtx = p, replyCtx
+	}
 	state.platform = p
 	state.replyCtx = replyCtx
 	state.mu.Unlock()
 
-	drainEvents(state.agentSession.Events())
+	e.drainBufferedTurns(state.agentSession.Events(), state, session, sessions, iKey, prevPlatform, prevReplyCtx)
 
 	compressor, ok := e.agent.(ContextCompressor)
 	if !ok || compressor.CompressCommand() == "" {
@@ -12602,6 +12600,86 @@ func drainEvents(ch <-chan Event) {
 			return
 		}
 	}
+}
+
+// drainBufferedTurns empties the event channel before the engine gives the
+// agent its next input (a queued message, or the compress command).
+//
+// The buffer does not only hold leftovers of the turn that just ended (e.g. a
+// deferred EventError from cmd.Wait()). While the engine is still delivering
+// the previous reply, the agent can run a whole turn on its own (Claude Code
+// does when a background task notification arrives), and nothing reads those
+// events until the next turn starts. drainEvents threw that reply away. Here
+// every turn that is complete in the buffer, i.e. ends in a terminal
+// EventResult, is delivered the way the unsolicited reader delivers one, and
+// model switch notices are relayed. Everything else is discarded as before:
+// errors, and the start of a turn the agent is still running (the rest of
+// that turn reaches the next turn's event loop).
+//
+// p and replyCtx must be those of the previous turn, which is where the
+// unsolicited reader would have delivered this output.
+func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any) {
+	var textParts []string
+	pending := 0 // events of the turn not yet completed
+	dropped := 0
+	defer func() {
+		dropped += pending
+		if dropped > 0 {
+			slog.Warn("drained stale events from previous turn", "session", sessionKey, "count", dropped)
+		}
+	}()
+	for {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			switch {
+			case event.Type == EventResult && event.Done:
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, event, textParts)
+				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
+				slog.Info("unsolicited turn complete",
+					"session", sessionKey,
+					"response_len", len(fullResponse),
+					"buffered", true)
+				textParts = nil
+				pending = 0
+			case event.Type == EventModelSwitch:
+				e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
+			case event.Type == EventError:
+				// Whatever came before the error belongs to a turn that
+				// will never complete.
+				dropped += pending + 1
+				textParts = nil
+				pending = 0
+			default:
+				if event.Type == EventText && event.Content != "" {
+					textParts = append(textParts, event.Content)
+				}
+				pending++
+			}
+		default:
+			return
+		}
+	}
+}
+
+// deliverUnsolicitedResult sends the reply of a turn the agent ran on its own
+// and records it in the session history. textParts are the turn's EventText
+// contents, used when the result event carries no text.
+func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Session, sessions *SessionManager, result Event, textParts []string) string {
+	fullResponse := result.Content
+	if fullResponse == "" && len(textParts) > 0 {
+		fullResponse = strings.Join(textParts, "")
+	}
+	if fullResponse != "" {
+		for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+			e.send(p, replyCtx, chunk)
+		}
+	}
+	session.AddHistory("assistant", fullResponse)
+	sessions.Save()
+	return fullResponse
 }
 
 // replyWithError applies outgoing rate limiting and p.Reply.
