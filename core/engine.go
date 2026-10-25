@@ -455,6 +455,12 @@ type Engine struct {
 	// usageLimitReply replaces the agent's refusal text when a turn is
 	// refused for a usage limit (empty: send the agent's text).
 	usageLimitReply string
+	// usageLimitNotified is set once usageLimitReply has gone out for the
+	// current limit episode; usageLimitNotifiedUntil is the reset time that
+	// reply announced (zero: until a turn gets an answer).
+	usageLimitMu            sync.Mutex
+	usageLimitNotified      bool
+	usageLimitNotifiedUntil time.Time
 
 	// Reply footer composition flags. The footer renders up to two lines:
 	//   line 1 — model · [effort ·] out/in/cw/cr · ctx%   (gated by showContextIndicator)
@@ -1033,8 +1039,8 @@ func (e *Engine) SetModelFallbackAction(action string) {
 // so a hook can hand the user's message to someone who can still answer it.
 // Extra: in_reply_to (the user message that started the turn), prompt (as the
 // agent was sent it, attachment paths included), limit_text, resets_at, and
-// reply (the configured text the user got instead, when set).
-func (e *Engine) reportUsageLimit(p Platform, sessionKey, msgID string, event Event) {
+// reply (the configured text the user got instead, when one was sent).
+func (e *Engine) reportUsageLimit(p Platform, sessionKey, msgID string, event Event, reply string) {
 	extra := map[string]any{"limit_text": event.Content, "prompt": event.UsageLimit.Prompt}
 	if msgID != "" {
 		extra["in_reply_to"] = msgID
@@ -1042,8 +1048,8 @@ func (e *Engine) reportUsageLimit(p Platform, sessionKey, msgID string, event Ev
 	if !event.UsageLimit.ResetsAt.IsZero() {
 		extra["resets_at"] = event.UsageLimit.ResetsAt.UTC().Format(time.RFC3339)
 	}
-	if e.usageLimitReply != "" {
-		extra["reply"] = e.usageLimitReply // what the user was told instead
+	if reply != "" {
+		extra["reply"] = reply // what the user was told instead
 	}
 	slog.Warn("turn refused for a usage limit", "session", sessionKey, "msg_id", msgID, "resets_at", extra["resets_at"])
 	e.hooks.Emit(HookEvent{Event: HookEventUsageLimited, SessionKey: sessionKey, Platform: p.Name(), Extra: extra})
@@ -1949,9 +1955,10 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
+		session.takeUsageLimit()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
-		return nil
+		return timerUsageLimitErr(session)
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
@@ -1964,7 +1971,19 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
+	session.takeUsageLimit()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
+	return timerUsageLimitErr(session)
+}
+
+// timerUsageLimitErr turns a refusal recorded during a timer run into the
+// job's error. The run may include messages queued behind the job's own
+// turn; a refusal of any of them counts, which can only make the job look
+// unanswered when it was answered, never the other way round.
+func timerUsageLimitErr(session *Session) error {
+	if l := session.takeUsageLimit(); l != nil {
+		return &UsageLimitError{ResetsAt: l.ResetsAt}
+	}
 	return nil
 }
 
@@ -5209,7 +5228,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
-				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, event, textParts)
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, sessionKey, event, textParts)
 
 				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
 
@@ -6254,10 +6273,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 			if event.UsageLimit != nil {
-				e.reportUsageLimit(p, sessionKey, msgID, event)
-				if e.usageLimitReply != "" {
-					fullResponse = e.usageLimitReply
+				session.noteUsageLimit(event.UsageLimit)
+				reply, silent := e.usageLimitReplyFor(event)
+				switch {
+				case silent:
+					// Already announced this episode. The refusal may have
+					// streamed in as text; none of it goes out.
+					fullResponse = "NO_REPLY"
+					partialText = ""
+					cardAnswerText.Reset()
+					reply = ""
+				case e.usageLimitReply == "":
+					reply = "" // the agent's own text goes out
+				default:
+					fullResponse = reply
 				}
+				e.reportUsageLimit(p, sessionKey, msgID, event, reply)
+			} else {
+				e.usageLimitCleared()
 			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
@@ -12675,7 +12708,7 @@ func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, se
 			}
 			switch {
 			case event.Type == EventResult && event.Done:
-				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, event, textParts)
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, sessionKey, event, textParts)
 				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
 				slog.Info("unsolicited turn complete",
 					"session", sessionKey,
@@ -12757,12 +12790,26 @@ func (e *Engine) answerBufferedPermission(state *interactiveState, p Platform, r
 // A NO_REPLY marker is handled as in a foreground turn: a bare marker sends
 // nothing, a trailing one is cut off. History keeps the original text, so the
 // agent still sees that it chose to stay silent.
-func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Session, sessions *SessionManager, result Event, textParts []string) string {
+func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Session, sessions *SessionManager, sessionKey string, result Event, textParts []string) string {
 	fullResponse := result.Content
 	if fullResponse == "" && len(textParts) > 0 {
 		fullResponse = strings.Join(textParts, "")
 	}
 	outgoing := fullResponse
+	if result.UsageLimit != nil {
+		reply, silent := e.usageLimitReplyFor(result)
+		switch {
+		case silent:
+			outgoing, reply = "", ""
+		case e.usageLimitReply == "":
+			reply = ""
+		default:
+			outgoing = reply
+		}
+		e.reportUsageLimit(p, sessionKey, "", result, reply)
+	} else {
+		e.usageLimitCleared()
+	}
 	if isSilentReply(outgoing) {
 		outgoing = ""
 	} else if stripped, ok := stripTrailingSilent(outgoing); ok {
