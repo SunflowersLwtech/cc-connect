@@ -1883,9 +1883,10 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
+		session.takeUsageLimit()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
-		return nil
+		return timerUsageLimitErr(session)
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
@@ -1898,7 +1899,19 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
+	session.takeUsageLimit()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
+	return timerUsageLimitErr(session)
+}
+
+// timerUsageLimitErr turns a refusal recorded during a timer run into the
+// job's error. The run may include messages queued behind the job's own
+// turn; a refusal of any of them counts, which can only make the job look
+// unanswered when it was answered, never the other way round.
+func timerUsageLimitErr(session *Session) error {
+	if l := session.takeUsageLimit(); l != nil {
+		return &UsageLimitError{ResetsAt: l.ResetsAt}
+	}
 	return nil
 }
 
@@ -6230,10 +6243,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 			if event.UsageLimit != nil {
-				e.reportUsageLimit(p, sessionKey, msgID, event)
-				if e.usageLimitReply != "" {
-					fullResponse = e.usageLimitReply
+				session.noteUsageLimit(event.UsageLimit)
+				reply, silent := e.usageLimitReplyFor(event)
+				switch {
+				case silent:
+					// Already announced this episode. The refusal may have
+					// streamed in as text; none of it goes out.
+					fullResponse = "NO_REPLY"
+					partialText = ""
+					cardAnswerText.Reset()
+					reply = ""
+				case e.usageLimitReply == "":
+					reply = "" // the agent's own text goes out
+				default:
+					fullResponse = reply
 				}
+				e.reportUsageLimit(p, sessionKey, msgID, event, reply)
+			} else {
+				e.usageLimitCleared()
 			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
