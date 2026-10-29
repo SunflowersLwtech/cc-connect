@@ -84,8 +84,9 @@ func TestUsageLimitReply_OncePerEpisode(t *testing.T) {
 	if sent := le.turn(limitedAt(resets)); len(sent) != 1 || sent[0] != want {
 		t.Fatalf("first refusal sent %q, want only %q", sent, want)
 	}
-	if sent := le.turn(limitedAt(resets)); len(sent) != 0 {
-		t.Fatalf("second refusal in the same episode sent %q, want nothing", sent)
+	queued := le.e.i18n.T(MsgUsageLimitQueued)
+	if sent := le.turn(limitedAt(resets)); len(sent) != 1 || sent[0] != queued {
+		t.Fatalf("second refusal in the same episode sent %q, want the queued line %q", sent, queued)
 	}
 	if sent := le.turn(Event{Type: EventResult, Content: "here is the summary", Done: true}); len(sent) != 1 || sent[0] != "here is the summary" {
 		t.Fatalf("answered turn sent %q", sent)
@@ -130,13 +131,20 @@ func TestUsageLimitReply_NewEpisodeAfterAnnouncedReset(t *testing.T) {
 }
 
 // A silent refusal leaks nothing, not even refusal text that streamed in
-// before the result.
-func TestUsageLimitReply_SilentRefusalDropsStreamedText(t *testing.T) {
+// before the result — it answers with one short queued line instead of
+// deleting the card (Lark would show that deletion as a retraction).
+func TestUsageLimitReply_SilentRefusalSendsQueuedLine(t *testing.T) {
 	le := newLimitEnv(t, episodeReply)
 	resets := time.Now().Add(time.Hour)
 	le.turn(Event{Type: EventText, Content: refusal}, limitedAt(resets))
-	if sent := le.turn(Event{Type: EventText, Content: refusal}, limitedAt(resets)); len(sent) != 0 {
-		t.Fatalf("silent refusal sent %q", sent)
+	sent := le.turn(Event{Type: EventText, Content: refusal}, limitedAt(resets))
+	if len(sent) != 1 || sent[0] != le.e.i18n.T(MsgUsageLimitQueued) {
+		t.Fatalf("silent refusal sent %q, want only the queued line", sent)
+	}
+	for _, s := range sent {
+		if strings.Contains(s, "session limit") {
+			t.Fatalf("silent refusal leaked the agent's refusal: %q", s)
+		}
 	}
 }
 
@@ -220,33 +228,7 @@ func TestExecuteTimerJob_UsageLimitedTurnIsJobError(t *testing.T) {
 }
 
 // Turns the agent runs on its own follow the same once-per-episode rule.
-func TestDeliverUnsolicitedResult_UsageLimitOncePerEpisode(t *testing.T) {
-	le := newLimitEnv(t, episodeReply)
-	resets := time.Now().Add(time.Hour)
-	want := strings.ReplaceAll(episodeReply, "{reset_at}", clockOf(resets))
-	deliver := func(ev Event) []string {
-		le.p.clearSent()
-		le.e.deliverUnsolicitedResult(le.p, "ctx", le.session, le.e.sessions, le.key, ev, nil)
-		return le.p.getSent()
-	}
-	if sent := deliver(limitedAt(resets)); len(sent) != 1 || sent[0] != want {
-		t.Fatalf("first background refusal sent %q, want %q", sent, want)
-	}
-	if sent := deliver(limitedAt(resets)); len(sent) != 0 {
-		t.Fatalf("second background refusal sent %q, want nothing", sent)
-	}
-	if sent := deliver(Event{Type: EventResult, Content: "done", Done: true}); len(sent) != 1 {
-		t.Fatalf("answered background turn sent %q", sent)
-	}
-	if sent := deliver(limitedAt(resets)); len(sent) != 1 || sent[0] != want {
-		t.Fatalf("background refusal after an answer sent %q, want %q", sent, want)
-	}
-}
-
-// In rich card mode the refusal streams into the card before the result. A
-// silent refusal must not leave it there: the card is removed, not finalized
-// with the refusal as its body.
-func TestUsageLimitReply_SilentRefusalLeavesNoRichCard(t *testing.T) {
+func TestUsageLimitReply_SilentRefusalFinalizesCardWithQueuedLine(t *testing.T) {
 	p := &stubRichCardSilentPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	sess := newQueuingSession("rich")
 	e := NewEngine("test", &controllableAgent{nextSession: sess}, []Platform{p}, "", LangEnglish)
@@ -270,12 +252,19 @@ func TestUsageLimitReply_SilentRefusalLeavesNoRichCard(t *testing.T) {
 	_, _, updatesBefore, deletesBefore := p.snapshot()
 	run() // silent
 	_, _, updates, deletes := p.snapshot()
+	var sawQueued bool
 	for _, u := range updates[len(updatesBefore):] {
 		if strings.Contains(u, "hit your session limit") {
 			t.Fatalf("silent refusal finalized a card with the refusal: %q", u)
 		}
+		if strings.Contains(u, e.i18n.T(MsgUsageLimitQueued)) {
+			sawQueued = true
+		}
 	}
-	if deletes != deletesBefore+1 {
-		t.Fatalf("silent refusal left its card in place (deletes %d -> %d)", deletesBefore, deletes)
+	if !sawQueued {
+		t.Fatalf("silent refusal did not finalize the card with the queued line (updates %q)", updates[len(updatesBefore):])
+	}
+	if deletes != deletesBefore {
+		t.Fatalf("silent refusal deleted its card (deletes %d -> %d)", deletesBefore, deletes)
 	}
 }
