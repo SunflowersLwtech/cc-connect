@@ -6282,8 +6282,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				switch {
 				case silent:
 					// Already announced this episode. The refusal may have
-					// streamed in as text; none of it goes out.
-					fullResponse = "NO_REPLY"
+					// streamed in as text; none of it goes out. Stay visible
+					// instead of silent: a silent turn's orphaned streaming
+					// card gets deleted, and Lark renders that as
+					// "recalled a message" — one short line is cheaper than a
+					// retraction the user reads as data loss.
+					fullResponse = e.i18n.T(MsgUsageLimitQueued)
 					partialText = ""
 					cardAnswerText.Reset()
 					reply = ""
@@ -12870,7 +12874,11 @@ func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Ses
 		reply, silent := e.usageLimitReplyFor(result)
 		switch {
 		case silent:
-			outgoing, reply = "", ""
+			// Same rule as a foreground turn: already announced, so send one
+			// short queued line rather than nothing — silence here reads as a
+			// lost message, and the alternative (dropping a card) reads as a
+			// retraction.
+			outgoing, reply = e.i18n.T(MsgUsageLimitQueued), ""
 		case e.usageLimitReply == "":
 			reply = ""
 		default:
