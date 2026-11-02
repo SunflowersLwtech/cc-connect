@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -87,11 +88,34 @@ func validateTimerJob(j *TimerJob) error {
 	return nil
 }
 
+// Fired timers stay in jobs.json for a while so that /timer/info and scripts
+// reading the file can see how a run ended. After that they are moved to an
+// append-only monthly archive (timers/archive/jobs-YYYY-MM.jsonl, one job per
+// line) that is never read back. Without this every fired timer stays in
+// jobs.json forever, and every Add and MarkFired rewrites all of that history
+// while holding the store lock.
+const (
+	// defaultTimerFiredRetention is how long a fired timer stays in jobs.json.
+	defaultTimerFiredRetention = 72 * time.Hour
+	// defaultTimerFiredKeepMax caps how many fired timers stay in jobs.json
+	// however recent they are, so a burst of timers cannot make each save
+	// slow again.
+	defaultTimerFiredKeepMax = 5000
+	// timerPruneInterval is how often saves look for fired timers to move.
+	timerPruneInterval = time.Hour
+)
+
 // TimerStore persists timer jobs to a JSON file.
 type TimerStore struct {
-	path string
-	mu   sync.Mutex
-	jobs []*TimerJob
+	path       string
+	archiveDir string
+	mu         sync.Mutex
+	jobs       []*TimerJob
+
+	firedRetention time.Duration // 0 = no age limit
+	firedKeepMax   int           // 0 = no count limit
+	lastPrune      time.Time
+	now            func() time.Time
 }
 
 func NewTimerStore(dataDir string) (*TimerStore, error) {
@@ -100,8 +124,21 @@ func NewTimerStore(dataDir string) (*TimerStore, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "jobs.json")
-	s := &TimerStore{path: path}
+	s := &TimerStore{
+		path:           path,
+		archiveDir:     filepath.Join(dir, "archive"),
+		firedRetention: defaultTimerFiredRetention,
+		firedKeepMax:   defaultTimerFiredKeepMax,
+		now:            time.Now,
+	}
 	s.load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pruneLocked(s.now()) > 0 {
+		if err := s.save(); err != nil {
+			slog.Warn("timer: failed to save after archiving fired jobs", "error", err)
+		}
+	}
 	return s, nil
 }
 
@@ -115,7 +152,12 @@ func (s *TimerStore) load() {
 	}
 }
 
+// save writes jobs.json. At most once per timerPruneInterval it first moves
+// fired jobs past their retention to the archive, so s.jobs may shrink.
 func (s *TimerStore) save() error {
+	if now := s.now(); now.Sub(s.lastPrune) >= timerPruneInterval {
+		s.pruneLocked(now)
+	}
 	data, err := json.MarshalIndent(s.jobs, "", "  ")
 	if err != nil {
 		return err
@@ -221,6 +263,125 @@ func (s *TimerStore) Get(id string) *TimerJob {
 		}
 	}
 	return nil
+}
+
+// PruneFired moves fired jobs that are older than the retention window, or
+// beyond the newest firedKeepMax fired jobs, from jobs.json to the monthly
+// archive, and returns how many it moved. Pending jobs are never moved.
+func (s *TimerStore) PruneFired(now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.pruneLocked(now)
+	if n == 0 {
+		return 0, nil
+	}
+	return n, s.save()
+}
+
+// pruneLocked drops the jobs PruneFired describes from s.jobs after
+// appending them to the archive. If the archive cannot be written the jobs
+// stay in jobs.json, so a job is never in neither place; a crash between
+// the append and the next save can leave it in both.
+func (s *TimerStore) pruneLocked(now time.Time) int {
+	s.lastPrune = now
+	var fired []*TimerJob
+	for _, j := range s.jobs {
+		if j.Fired {
+			fired = append(fired, j)
+		}
+	}
+	sort.SliceStable(fired, func(a, b int) bool { return timerFiredTime(fired[a]).After(timerFiredTime(fired[b])) })
+	cutoff := now.Add(-s.firedRetention)
+	move := make(map[*TimerJob]bool)
+	for i, j := range fired {
+		if (s.firedKeepMax > 0 && i >= s.firedKeepMax) || (s.firedRetention > 0 && timerFiredTime(j).Before(cutoff)) {
+			move[j] = true
+		}
+	}
+	if len(move) == 0 {
+		return 0
+	}
+
+	var moved, kept []*TimerJob
+	for _, j := range s.jobs {
+		if move[j] {
+			moved = append(moved, j)
+		} else {
+			kept = append(kept, j)
+		}
+	}
+	if err := s.archive(moved); err != nil {
+		slog.Warn("timer: failed to archive fired jobs; keeping them in jobs.json", "count", len(moved), "error", err)
+		return 0
+	}
+	s.jobs = kept
+	slog.Info("timer: archived fired jobs", "count", len(moved), "kept", len(kept), "dir", s.archiveDir)
+	return len(moved)
+}
+
+// timerFiredTime is when a fired job fired, or when it was due if that was
+// not recorded.
+func timerFiredTime(j *TimerJob) time.Time {
+	if !j.FiredAt.IsZero() {
+		return j.FiredAt
+	}
+	return j.ScheduledAt
+}
+
+// archive appends jobs, one JSON object per line, to the archive file of the
+// month each one fired in.
+func (s *TimerStore) archive(jobs []*TimerJob) error {
+	if err := os.MkdirAll(s.archiveDir, 0o755); err != nil {
+		return err
+	}
+	byMonth := make(map[string][]byte)
+	var months []string
+	for _, j := range jobs {
+		line, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		m := timerFiredTime(j).Format("2006-01")
+		if _, ok := byMonth[m]; !ok {
+			months = append(months, m)
+		}
+		byMonth[m] = append(append(byMonth[m], line...), '\n')
+	}
+	sort.Strings(months)
+	for _, m := range months {
+		if err := appendTimerArchive(filepath.Join(s.archiveDir, "jobs-"+m+".jsonl"), byMonth[m]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func appendTimerArchive(path string, lines []byte) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// An earlier append cut short leaves a partial last line; start on a new
+	// line so it does not swallow the first job of this batch.
+	if st, err := f.Stat(); err != nil {
+		return err
+	} else if st.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := f.ReadAt(last, st.Size()-1); err != nil {
+			return err
+		}
+		if last[0] != '\n' {
+			lines = append([]byte{'\n'}, lines...)
+		}
+	}
+	if _, err := f.Write(lines); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // ListPending returns all non-fired timer jobs.
