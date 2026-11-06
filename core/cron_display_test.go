@@ -48,12 +48,6 @@ func TestCronDisplay_UsesScheduleTimezone(t *testing.T) {
 	if err := e.cronScheduler.AddJob(&CronJob{ID: "next", Project: "test", SessionKey: "test:ch1", CronExpr: expr, Prompt: "next", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	// The v1.5.1 release branch populates robfig/cron Entry.Next when the
-	// scheduler starts; current main computes it during registration.
-	if err := e.cronScheduler.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer e.cronScheduler.Stop()
 	loc := cronDisplayLocation(expr)
 	if loc.String() != "Asia/Shanghai" {
 		t.Fatalf("cronDisplayLocation = %v", loc)

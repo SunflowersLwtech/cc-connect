@@ -659,12 +659,28 @@ func load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	resolveEnvInConfig(cfg)
+	expandHomeInConfig(cfg)
 	if cfg.DataDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			cfg.DataDir = filepath.Join(home, ".cc-connect")
 		} else {
+			// HOME unset (common when systemd unit does not inject it):
+			// warn loudly, because a relative data_dir will be resolved
+			// differently by any subprocess that changes cwd — most
+			// notably the claude/codex/etc. agent processes that cd into
+			// work_dir before reading files written by the supervisor.
 			cfg.DataDir = ".cc-connect"
+			slog.Warn("config: data_dir empty and HOME unset; falling back to relative path. Set data_dir to an absolute path in config.toml, or ensure the service manager injects HOME.")
 		}
+	}
+	cfg.DataDir = expandUserPath(cfg.DataDir)
+	// Always resolve to an absolute path so a data_dir written by the
+	// supervisor is read back at the same location by agent subprocesses
+	// regardless of their working directory. Users who write a relative
+	// data_dir explicitly still get it anchored to the supervisor's cwd
+	// (the same behaviour they would see running any other CLI).
+	if abs, err := filepath.Abs(cfg.DataDir); err == nil {
+		cfg.DataDir = abs
 	}
 	cfg.AttachmentSend = strings.ToLower(strings.TrimSpace(cfg.AttachmentSend))
 	if cfg.AttachmentSend == "" {
@@ -703,6 +719,38 @@ var envPlaceholderPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func resolveEnvInConfig(cfg *Config) {
 	resolveEnvValue(reflect.ValueOf(cfg))
+}
+
+// expandHomeInConfig expands a leading ~ / ~/ in path-like agent options
+// (work_dir, base_dir) to the user's home directory. Without this, a config
+// like work_dir = "~/.codex/workspace" is passed literally to exec.Cmd.Dir,
+// which fails at spawn time with a misleading "fork/exec ...: no such file
+// or directory" that points at the agent binary instead of the directory.
+func expandHomeInConfig(cfg *Config) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	for i := range cfg.Projects {
+		proj := &cfg.Projects[i]
+		proj.BaseDir = expandLeadingHome(proj.BaseDir, home)
+		if v, ok := proj.Agent.Options["work_dir"]; ok {
+			if s, ok := v.(string); ok {
+				proj.Agent.Options["work_dir"] = expandLeadingHome(s, home)
+			}
+		}
+	}
+}
+
+// expandLeadingHome expands "~" and "~/" at the start of a path to home.
+func expandLeadingHome(s, home string) string {
+	if s == "~" {
+		return home
+	}
+	if strings.HasPrefix(s, "~/") {
+		return filepath.Join(home, s[2:])
+	}
+	return s
 }
 
 func resolveEnvValue(v reflect.Value) {

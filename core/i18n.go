@@ -256,6 +256,7 @@ const (
 	MsgListSwitchHint            MsgKey = "list_switch_hint"
 	MsgListError                 MsgKey = "list_error"
 	MsgHistoryEmpty              MsgKey = "history_empty"
+	MsgHistoryReadFailed         MsgKey = "history_read_failed"
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
 	MsgNameNoSession             MsgKey = "name_no_session"
@@ -1531,6 +1532,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "現在のセッションに履歴がありません。",
 		LangSpanish:            "No hay historial en la sesión actual.",
 	},
+	MsgHistoryReadFailed: {
+		LangEnglish:            "Failed to read session history.",
+		LangChinese:            "读取会话历史失败。",
+		LangTraditionalChinese: "讀取會話歷史失敗。",
+		LangJapanese:           "セッション履歴の読み取りに失敗しました。",
+		LangSpanish:            "No se pudo leer el historial de la sesión.",
+	},
 	MsgNameUsage: {
 		LangEnglish:            "Usage:\n`/name <text>` — name the current session\n`/name <number> <text>` — name a session by list number",
 		LangChinese:            "用法：\n`/name <名称>` — 命名当前会话\n`/name <序号> <名称>` — 按列表序号命名会话",
@@ -2648,11 +2656,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Niveles de razonamiento disponibles:\n",
 	},
 	MsgReasoningUsage: {
-		LangEnglish:            "Usage: `/reasoning <number>` or `/reasoning <low|medium|high|xhigh|max>`",
-		LangChinese:            "用法: `/reasoning <序号>` 或 `/reasoning <low|medium|high|xhigh|max>`",
-		LangTraditionalChinese: "用法: `/reasoning <序號>` 或 `/reasoning <low|medium|high|xhigh|max>`",
-		LangJapanese:           "使い方: `/reasoning <番号>` または `/reasoning <low|medium|high|xhigh|max>`",
-		LangSpanish:            "Uso: `/reasoning <número>` o `/reasoning <low|medium|high|xhigh|max>`",
+		LangEnglish:            "Usage: `/reasoning <number>` or `/reasoning <%s>`",
+		LangChinese:            "用法: `/reasoning <序号>` 或 `/reasoning <%s>`",
+		LangTraditionalChinese: "用法: `/reasoning <序號>` 或 `/reasoning <%s>`",
+		LangJapanese:           "使い方: `/reasoning <番号>` または `/reasoning <%s>`",
+		LangSpanish:            "Uso: `/reasoning <número>` o `/reasoning <%s>`",
 	},
 	MsgModeUsage: {
 		LangEnglish:            "\nUse `/mode <name>` to switch.\nAvailable: %s",

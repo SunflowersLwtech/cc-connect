@@ -1059,6 +1059,7 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 		false,                                // disableVerbose
 		spawnOpts,
 		0,  // maxContextTokens
+		0,  // ctxWindowTokens
 		"", // ccDataDir (lets ensureSharedSystemPromptFile fall back to TempDir)
 		"", // lang
 	)
@@ -1181,7 +1182,7 @@ func TestClaudeUsageFromTranscriptLine(t *testing.T) {
 		line := []byte(`{"type":"assistant","message":{"model":"MiniMax-M3",` +
 			`"usage":{"input_tokens":146,"cache_creation_input_tokens":0,` +
 			`"cache_read_input_tokens":38802,"output_tokens":9}}}`)
-		u := claudeUsageFromTranscriptLine(line)
+		u := claudeUsageFromTranscriptLine(line, 0)
 		if u == nil {
 			t.Fatal("expected usage, got nil")
 		}
@@ -1196,20 +1197,20 @@ func TestClaudeUsageFromTranscriptLine(t *testing.T) {
 	t.Run("assistant with the all-zero usage MiniMax streams", func(t *testing.T) {
 		line := []byte(`{"type":"assistant","message":{"model":"MiniMax-M3",` +
 			`"usage":{"input_tokens":0,"output_tokens":0,"service_tier":"standard"}}}`)
-		if u := claudeUsageFromTranscriptLine(line); u != nil {
+		if u := claudeUsageFromTranscriptLine(line, 0); u != nil {
 			t.Fatalf("all-zero usage must not produce a snapshot, got %+v", u)
 		}
 	})
 
 	t.Run("non-assistant line", func(t *testing.T) {
 		line := []byte(`{"type":"user","message":{"role":"user","content":"hi"},"usage":{"input_tokens":5}}`)
-		if u := claudeUsageFromTranscriptLine(line); u != nil {
+		if u := claudeUsageFromTranscriptLine(line, 0); u != nil {
 			t.Fatalf("user line must not produce a snapshot, got %+v", u)
 		}
 	})
 
 	t.Run("malformed json", func(t *testing.T) {
-		if u := claudeUsageFromTranscriptLine([]byte(`not json`)); u != nil {
+		if u := claudeUsageFromTranscriptLine([]byte(`not json`), 0); u != nil {
 			t.Fatalf("garbage must not produce a snapshot, got %+v", u)
 		}
 	})
@@ -1227,7 +1228,7 @@ func TestTailUsageFromTranscript(t *testing.T) {
 		`{"type":"assistant","message":{"model":"MiniMax-M3","usage":{"input_tokens":120,"cache_read_input_tokens":38948}}}`,
 	})
 
-	u, found := tailUsageFromTranscript(path, 1<<20)
+	u, found := tailUsageFromTranscript(path, 1<<20, 0)
 	if !found {
 		t.Fatal("found = false, want true (file is readable)")
 	}
@@ -1250,7 +1251,7 @@ func TestTailUsageFromTranscript_LineSpanningChunks(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"` + huge + `"}]}}`,
 	})
 
-	u, found := tailUsageFromTranscript(path, 1<<30)
+	u, found := tailUsageFromTranscript(path, 1<<30, 0)
 	if !found {
 		t.Fatal("found = false, want true")
 	}
@@ -1271,7 +1272,7 @@ func TestTailUsageFromTranscript_BoundedWindow(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":"` + strings.Repeat("y", 5000) + `"}}`,
 	})
 
-	u, found := tailUsageFromTranscript(path, 256) // window far too small
+	u, found := tailUsageFromTranscript(path, 256, 0) // window far too small
 	if !found {
 		t.Error("found = false, want true — the file WAS readable, there was just nothing usable in the window")
 	}
@@ -1284,7 +1285,7 @@ func TestTailUsageFromTranscript_BoundedWindow(t *testing.T) {
 // from readable-but-empty: callers log differently, and the auto-compress
 // decision treats them differently.
 func TestTailUsageFromTranscript_MissingFile(t *testing.T) {
-	u, found := tailUsageFromTranscript(filepath.Join(t.TempDir(), "nope.jsonl"), 1<<20)
+	u, found := tailUsageFromTranscript(filepath.Join(t.TempDir(), "nope.jsonl"), 1<<20, 0)
 	if found {
 		t.Error("found = true for a missing file, want false")
 	}
@@ -1301,7 +1302,7 @@ func TestTailUsageFromTranscript_NoAssistantUsage(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":"hi"}}`,
 		`{"type":"assistant","message":{"model":"m","usage":{"input_tokens":0,"output_tokens":1}}}`,
 	})
-	u, found := tailUsageFromTranscript(path, 1<<20)
+	u, found := tailUsageFromTranscript(path, 1<<20, 0)
 	if !found {
 		t.Error("found = false, want true")
 	}

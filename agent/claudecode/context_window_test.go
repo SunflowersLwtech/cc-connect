@@ -234,6 +234,23 @@ func TestHandleResultWithoutReportedWindow(t *testing.T) {
 	})
 }
 
+// TestContextWindowOverrideWinsOverReportedWindow: context_window_tokens is an
+// explicit operator choice and outranks what the CLI reports.
+func TestContextWindowOverrideWinsOverReportedWindow(t *testing.T) {
+	cs := newWindowTestSession(t, "claude-opus-5-5")
+	cs.ctxWindowOverride = 500_000
+
+	cs.handleAssistant(windowAssistantEvent(2, 695, 292_943))
+	cs.handleResult(windowResultEvent(map[string]any{"claude-opus-5-5": modelUsageEntry(1_000_000, 45_208)}))
+	if u := cs.GetContextUsage(); u.ContextWindow != 500_000 {
+		t.Errorf("after result: ContextWindow = %d, want the 500000 override", u.ContextWindow)
+	}
+
+	cs.handleAssistant(windowAssistantEvent(2, 700, 293_500))
+	if u := cs.GetContextUsage(); u.ContextWindow != 500_000 {
+		t.Errorf("next assistant event: ContextWindow = %d, want the 500000 override", u.ContextWindow)
+	}
+}
 // TestTranscriptSnapshotUsesReportedContextWindow covers the snapshot read from
 // the transcript tail, which is what a provider sending empty assistant usage
 // blocks gets (see TestHandleResultUsesTranscriptTailWhenAssistantEmpty). It is

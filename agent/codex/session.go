@@ -154,9 +154,9 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 		args = append(append([]string{}, cs.cliExtraArgs...), args...)
 	}
 
-	bin := cs.cmd
-	if bin == "" {
-		bin = "codex"
+	bin, err := resolveCodexExecutable(cs.cmd)
+	if err != nil {
+		return fmt.Errorf("codexSession: resolve CLI: %w", err)
 	}
 
 	slog.Debug("codexSession: launching", "resume", isResume, "args", core.RedactArgs(args))
@@ -200,11 +200,20 @@ func (cs *codexSession) stageImages(prompt string, images []core.ImageAttachment
 	}
 
 	imagePaths := make([]string, 0, len(images))
-	for i, img := range images {
+	for _, img := range images {
 		ext := codexImageExt(img.MimeType)
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(imgDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
+		// Sessions share imgDir, so reserve a unique path before writing.
+		file, err := os.CreateTemp(imgDir, "img_*"+ext)
+		if err != nil {
+			return "", nil, fmt.Errorf("codexSession: create image: %w", err)
+		}
+		fpath := file.Name()
+		_, writeErr := file.Write(img.Data)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			if removeErr := os.Remove(fpath); removeErr != nil {
+				slog.Warn("codexSession: remove incomplete image", "path", fpath, "error", removeErr)
+			}
 			return "", nil, fmt.Errorf("codexSession: save image: %w", err)
 		}
 		imagePaths = append(imagePaths, fpath)
@@ -677,8 +686,13 @@ func codexToolSuccess(status string, exitCode *int) bool {
 	return s == "completed" || s == "success" || s == "succeeded" || s == "ok"
 }
 
-func loadCodexRuntimeConfig(ctx context.Context, workDir string, extraEnv []string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, "codex", "app-server")
+func loadCodexRuntimeConfig(ctx context.Context, cliBin string, cliExtraArgs []string, workDir string, extraEnv []string) (string, string, error) {
+	bin, err := resolveCodexExecutable(cliBin)
+	if err != nil {
+		return "", "", fmt.Errorf("runtime config resolve CLI: %w", err)
+	}
+	args := append(append([]string(nil), cliExtraArgs...), "app-server")
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = workDir
 	prepareCmdForKill(cmd)
 	if len(extraEnv) > 0 {
@@ -860,7 +874,7 @@ func (cs *codexSession) runtimeConfig() (string, string) {
 	ctx, cancel := context.WithTimeout(cs.ctx, codexRuntimeConfigTimeout)
 	defer cancel()
 
-	model, effort, err := loadCodexRuntimeConfig(ctx, cs.workDir, cs.extraEnv)
+	model, effort, err := loadCodexRuntimeConfig(ctx, cs.cmd, cs.cliExtraArgs, cs.workDir, cs.extraEnv)
 	if err == nil {
 		cs.runtimeCfgModel = model
 		cs.runtimeCfgEffort = effort

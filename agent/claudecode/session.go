@@ -95,6 +95,13 @@ type claudeSession struct {
 	// ~/.claude/projects/<key>/ layout, which a unit test cannot fabricate.
 	transcriptOverride string
 
+	// ctxWindowOverride is the user-configured context window size used by
+	// the "ctx N%" indicator. When > 0 it wins over reportedCtxWindow; when
+	// <= 0, contextWindow uses reportedCtxWindow and then the model-name
+	// heuristic (200K, 1M for [1m] variants). The Agent sets
+	// this from `[projects.agent.options].context_window_tokens` at session
+	// construction time and never mutates it afterwards.
+	ctxWindowOverride int
 	// reportedCtxWindow is the context window Claude Code reported for this
 	// session's model in the most recent result event's modelUsage map.
 	// Zero until a result event carries one; until then (and on CLIs that
@@ -264,7 +271,7 @@ func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) str
 	return strings.Join(parts, "\n")
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ctxWindowTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root.
@@ -538,6 +545,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		ccHooks:             newCCPermissionHookRunner(workDir),
 		startupWarning:      rootDowngradeWarning,
 		promptFilePath:      cleanupPromptPath,
+		ctxWindowOverride:   ctxWindowTokens,
 	}
 	cs.setPermissionMode(mode)
 	cs.sessionID.Store(sessionID)
@@ -791,7 +799,6 @@ func (cs *claudeSession) handleRefusalFallback(raw map[string]any) {
 	case <-cs.ctx.Done():
 	}
 }
-
 // claudeUsageFromTranscriptLine parses one JSONL transcript line and returns
 // the exact prompt size it records, or nil when the line is not an assistant
 // event carrying a usable usage block.
@@ -800,7 +807,7 @@ func (cs *claudeSession) handleRefusalFallback(raw map[string]any) {
 // on a transcript the cache_read of the next entry equals the previous entry's
 // in+cc+cr (verified against live data: cr 38802 → in+cr 38948 → next cr 38948),
 // so the value does NOT accumulate the way the result event's aggregate does.
-func claudeUsageFromTranscriptLine(line []byte) *core.ContextUsage {
+func claudeUsageFromTranscriptLine(line []byte, override int) *core.ContextUsage {
 	if len(line) == 0 || !bytes.Contains(line, []byte(`"usage"`)) {
 		return nil
 	}
@@ -831,7 +838,7 @@ func claudeUsageFromTranscriptLine(line []byte) *core.ContextUsage {
 		InputTokens:              input,
 		CachedInputTokens:        cr,
 		CacheCreationInputTokens: cc,
-		ContextWindow:            claudeContextWindow(model),
+		ContextWindow:            claudeContextWindow(model, override),
 	}
 }
 
@@ -859,7 +866,7 @@ const transcriptLineCap = 64 << 20 // 64MiB
 // and there was nothing usable" from "could not read it at all" — production
 // callers only need usage != nil, but the distinction is what lets a test assert
 // the reader actually opened and scanned the file rather than silently bailing.
-func tailUsageFromTranscript(path string, windowBytes int64) (usage *core.ContextUsage, found bool) {
+func tailUsageFromTranscript(path string, windowBytes int64, override int) (usage *core.ContextUsage, found bool) {
 	if path == "" {
 		return nil, false
 	}
@@ -925,7 +932,7 @@ func tailUsageFromTranscript(path string, windowBytes int64) (usage *core.Contex
 				begin = nl + 1
 			}
 			if line := buf[begin:end]; len(line) > 0 {
-				if u := claudeUsageFromTranscriptLine(line); u != nil {
+				if u := claudeUsageFromTranscriptLine(line, override); u != nil {
 					return u, true
 				}
 			}
@@ -965,7 +972,7 @@ func tailUsageFromTranscript(path string, windowBytes int64) (usage *core.Contex
 // assistant event with a non-zero prompt. Callers must treat nil as "no exact
 // data" and NOT substitute an estimate.
 func (cs *claudeSession) recoverUsageFromTranscript() *core.ContextUsage {
-	u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow)
+	u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow, cs.ctxWindowOverride)
 	if u != nil {
 		slog.Info("claudeSession: recovered context usage from transcript",
 			"used", u.UsedTokens, "input", u.InputTokens,
@@ -1260,7 +1267,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	cs.usageMu.Unlock()
 
 	if !haveExact {
-		if u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow); u != nil {
+		if u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow, cs.ctxWindowOverride); u != nil {
 			cs.usageMu.Lock()
 			// A recovered snapshot is a placeholder and a result snapshot is an
 			// aggregate — the transcript's per-call figure supersedes both.
@@ -1886,19 +1893,23 @@ func shellJoinArgs(args []string) string {
 }
 
 // contextWindow returns the window the "ctx N%" indicator divides by: the
-// size Claude Code reported for this session's model, then the model-name
-// heuristic applied to model.
+// configured override, then the size Claude Code reported for this session's
+// model, then the model-name heuristic applied to model.
 func (cs *claudeSession) contextWindow(model string) int {
 	if w := cs.knownContextWindow(); w > 0 {
 		return w
 	}
-	return claudeContextWindow(model)
+	return claudeContextWindow(model, 0)
 }
 
-// knownContextWindow returns the window that needs no guessing — the size
-// Claude Code reported in a result event's modelUsage — or 0 when none has
-// been reported yet.
+// knownContextWindow returns the window that needs no guessing — the
+// configured context_window_tokens override, else the size Claude Code
+// reported in a result event's modelUsage — or 0 when neither is available.
+// The override wins because it is an explicit operator choice.
 func (cs *claudeSession) knownContextWindow() int {
+	if cs.ctxWindowOverride > 0 {
+		return cs.ctxWindowOverride
+	}
 	return int(cs.reportedCtxWindow.Load())
 }
 
@@ -1948,7 +1959,14 @@ func claudeModelUsageContextWindow(raw map[string]any, model string) int {
 // result event does not carry a modelUsage map. The "[1m]" suffix
 // (case-insensitive) signals the 1M-context variants; everything else
 // defaults to the standard 200k window.
-func claudeContextWindow(model string) int {
+// override (set from `[projects.agent.options].context_window_tokens`)
+// wins over the model-name heuristic when > 0. This lets operators pin a
+// specific window size for custom routers, fine-tuned models, or non-Claude
+// endpoints whose model id does not match Claude Code's naming scheme.
+func claudeContextWindow(model string, override int) int {
+	if override > 0 {
+		return override
+	}
 	lower := strings.ToLower(strings.TrimSpace(model))
 	if lower == "" {
 		return 200_000

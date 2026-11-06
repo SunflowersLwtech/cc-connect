@@ -20,6 +20,15 @@ import (
 
 type stubAgent struct{}
 
+type failingHistoryAgent struct {
+	stubAgent
+	err error
+}
+
+func (a *failingHistoryAgent) GetSessionHistory(context.Context, string, int) ([]HistoryEntry, error) {
+	return []HistoryEntry{{Role: "user", Content: "partial history"}}, a.err
+}
+
 func (a *stubAgent) Name() string { return "stub" }
 func (a *stubAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
 	return &stubAgentSession{}, nil
@@ -442,11 +451,12 @@ func (p *stubAskQuestionRichCardPlatform) BuildRichCard(status CardStatus, title
 
 type stubModelModeAgent struct {
 	stubAgent
-	model           string
-	mode            string
-	reasoningEffort string
-	providers       []ProviderConfig
-	active          string
+	model            string
+	mode             string
+	reasoningEffort  string
+	reasoningEfforts []string
+	providers        []ProviderConfig
+	active           string
 }
 
 type stubStrictModelAgent struct {
@@ -545,6 +555,9 @@ func (a *stubModelModeAgent) GetReasoningEffort() string {
 }
 
 func (a *stubModelModeAgent) AvailableReasoningEfforts() []string {
+	if len(a.reasoningEfforts) > 0 {
+		return append([]string(nil), a.reasoningEfforts...)
+	}
 	return []string{"low", "medium", "high", "xhigh"}
 }
 
@@ -3826,6 +3839,33 @@ func TestCmdCurrent_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 }
 
+func TestCmdHistory_ReadFailureIsVisibleWithoutLeakingPath(t *testing.T) {
+	const secretPath = "/private/codex-home/sessions/secret.jsonl"
+	agent := &failingHistoryAgent{err: fmt.Errorf("scan %s: token too long", secretPath)}
+	msg := &Message{SessionKey: "test:history-failure", ReplyCtx: "ctx"}
+
+	plain := &stubPlatformEngine{n: "plain"}
+	textEngine := NewEngine("test", agent, []Platform{plain}, "", LangEnglish)
+	textEngine.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("broken", "test")
+	textEngine.cmdHistory(plain, msg, []string{"10"})
+	sent := plain.getSent()
+	if len(sent) != 1 || sent[0] != textEngine.i18n.T(MsgHistoryReadFailed) || strings.Contains(sent[0], secretPath) {
+		t.Fatalf("text history response = %q; want generic localized failure without path", sent)
+	}
+
+	cardPlatform := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "cards"}}
+	cardEngine := NewEngine("test", agent, []Platform{cardPlatform}, "", LangEnglish)
+	cardEngine.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("broken", "test")
+	cardEngine.cmdHistory(cardPlatform, msg, nil)
+	if len(cardPlatform.repliedCards) != 1 {
+		t.Fatalf("card replies = %d, want 1", len(cardPlatform.repliedCards))
+	}
+	cardText := cardPlatform.repliedCards[0].RenderText()
+	if !strings.Contains(cardText, cardEngine.i18n.T(MsgHistoryReadFailed)) || strings.Contains(cardText, secretPath) || strings.Contains(cardText, "partial history") {
+		t.Fatalf("card history response = %q; want generic localized failure without path or partial history", cardText)
+	}
+}
+
 func TestCmdCurrent_ShowsAgentSummaryWhenNoCustomName(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubListAgent{sessions: []AgentSessionInfo{
@@ -5464,6 +5504,48 @@ func TestCmdReasoning_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	}
 }
 
+func TestCmdReasoning_UsageListsAgentEfforts(t *testing.T) {
+	efforts := []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+	wantUsage := "Usage: `/reasoning <number>` or `/reasoning <" + strings.Join(efforts, "|") + ">`"
+
+	t.Run("list", func(t *testing.T) {
+		p := &stubPlatformEngine{n: "plain"}
+		agent := &stubModelModeAgent{reasoningEfforts: efforts}
+		e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+		e.cmdReasoning(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, nil)
+
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], wantUsage) {
+			t.Fatalf("sent = %v, want dynamic usage %q", p.sent, wantUsage)
+		}
+	})
+
+	t.Run("invalid value", func(t *testing.T) {
+		p := &stubPlatformEngine{n: "plain"}
+		agent := &stubModelModeAgent{reasoningEfforts: efforts}
+		e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+		e.cmdReasoning(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, []string{"invalid"})
+
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], wantUsage) {
+			t.Fatalf("sent = %v, want dynamic usage %q", p.sent, wantUsage)
+		}
+	})
+
+	t.Run("card note", func(t *testing.T) {
+		agent := &stubModelModeAgent{reasoningEfforts: efforts}
+		e := NewEngine("test", agent, nil, "", LangEnglish)
+		card := e.renderReasoningCard()
+
+		for _, element := range card.Elements {
+			if note, ok := element.(CardNote); ok && note.Text == wantUsage {
+				return
+			}
+		}
+		t.Fatalf("card elements = %#v, want dynamic usage note %q", card.Elements, wantUsage)
+	})
+}
+
 func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubModelModeAgent{}
@@ -6622,6 +6704,64 @@ func TestSendAskQuestionPrompt_CardPlatform(t *testing.T) {
 	askqCount := countCardActionValues(card, "askq:")
 	if askqCount != 3 {
 		t.Errorf("expected 3 askq buttons, got %d", askqCount)
+	}
+}
+
+// TestSendAskQuestionPrompt_CardPlatform_SingleSelectUsesActionRows is a
+// regression for issue #1658 (Feishu pi ask_user_question card: button clicks
+// never dispatched on mobile/desktop). The old layout rendered each option
+// as a `column_set` row with the button nested inside a column; Feishu mobile
+// clients dropped those click events, and even on desktop the layout was
+// reported as unreliable. The fix renders each option as a markdown line +
+// a flat action row (tag:"action") whose single button carries the askq:
+// value and the askq_label/askq_question extras — the same shape that
+// permission cards use for their cmd: clicks, which the issue reporter
+// confirmed dispatch reliably.
+func TestSendAskQuestionPrompt_CardPlatform_SingleSelectUsesActionRows(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0)
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
+	}
+	card := p.sentCards[0]
+
+	// Count askq action rows. We expect exactly 3 options, each rendered as
+	// its own CardActions (one button per row) — not as nested CardListItem.
+	var actionRows int
+	var askqButtons int
+	var sawCardListItem bool
+	for _, elem := range card.Elements {
+		switch e := elem.(type) {
+		case CardActions:
+			for _, btn := range e.Buttons {
+				if strings.HasPrefix(btn.Value, "askq:") {
+					askqButtons++
+					// Each button must carry the askq_label + askq_question
+					// extras so the Feishu callback handler can render the
+					// post-answer card without re-fetching the question.
+					if btn.Extra["askq_label"] == "" {
+						t.Errorf("askq button %q missing askq_label extra", btn.Text)
+					}
+					if btn.Extra["askq_question"] == "" {
+						t.Errorf("askq button %q missing askq_question extra", btn.Text)
+					}
+				}
+			}
+			actionRows++
+		case CardListItem:
+			sawCardListItem = true
+		}
+	}
+	if actionRows != 3 {
+		t.Errorf("expected 3 CardActions rows (one per option), got %d", actionRows)
+	}
+	if askqButtons != 3 {
+		t.Errorf("expected 3 askq buttons in action rows, got %d", askqButtons)
+	}
+	if sawCardListItem {
+		t.Errorf("CardListItem must not be used for single-select AskUserQuestion on Feishu (issue #1658)")
 	}
 }
 
@@ -9626,6 +9766,48 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 	e.interactiveMu.Unlock()
 	if exists {
 		t.Error("expected interactive state to be cleaned up after /mode")
+	}
+}
+
+// Regression: the /list card button reaches executeCardAction, which cleared the
+// session history after switching. cmdSwitch never did, and documents why —
+// SwitchToAgentSession returns the existing Session when the agent session ID is
+// known, so wiping History makes /status and /history report zero messages right
+// after a switch that succeeded. Typing "/switch 1" kept its history; tapping the
+// same session in the card did not.
+func TestExecuteCardAction_SwitchPreservesHistory(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	agent := &stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "sess-a1", Summary: "a1"},
+		{ID: "sess-a2", Summary: "a2"},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+	sessions := e.sessions
+
+	// A session with recorded history, then a second session that became active —
+	// the state a /list card switch encounters.
+	first := sessions.GetOrCreateActive(sessionKey)
+	first.SetAgentSessionID("sess-a1", "stub")
+	first.AddHistory("user", "A1 first message")
+	first.AddHistory("assistant", "A1 reply")
+	sessions.Save()
+
+	sessions.NewSession(sessionKey, "a2")
+	sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("sess-a2", "stub")
+	sessions.Save()
+
+	// "act:/switch 1" is what a /list card row sends.
+	_ = e.handleCardNav("act:/switch 1", sessionKey)
+
+	active := sessions.GetOrCreateActive(sessionKey)
+	if active.GetAgentSessionID() != "sess-a1" {
+		t.Fatalf("active session after card /switch = %q, want sess-a1", active.GetAgentSessionID())
+	}
+	hist := active.GetHistory(10)
+	if len(hist) == 0 || !strings.Contains(hist[0].Content, "A1") {
+		t.Fatalf("history after card /switch = %v, want the A1 conversation preserved", hist)
 	}
 }
 
