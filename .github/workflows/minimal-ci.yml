@@ -1,0 +1,50 @@
+name: Minimal CI
+
+on:
+  push:
+    branches:
+      - n150/timer-prune
+  pull_request:
+    branches:
+      - n150/timer-prune
+      - n150/usage-limit-card
+      - main
+
+jobs:
+  test:
+    name: Linux Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build web assets
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build binary
+        run: go build ./cmd/cc-connect
+
+      - name: Run tests
+        run: go test ./...
+        env:
+          CI: "true"
