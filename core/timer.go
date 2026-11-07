@@ -418,7 +418,7 @@ func appendTimerArchive(path string, lines []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// An earlier append cut short leaves a partial last line; start on a new
 	// line so it does not swallow the first job of this batch.
 	if st, err := f.Stat(); err != nil {
