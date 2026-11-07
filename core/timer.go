@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -87,11 +88,53 @@ func validateTimerJob(j *TimerJob) error {
 	return nil
 }
 
+// Fired timers stay in jobs.json for a while so that /timer/info and scripts
+// reading the file can see how a run ended. After that they are moved to an
+// append-only monthly archive (timers/archive/jobs-YYYY-MM.jsonl, one job per
+// line) that is never read back. Without this every fired timer stays in
+// jobs.json forever, and every Add and MarkFired rewrites all of that history
+// while holding the store lock.
+//
+// This is only safe while everything that reads a fired timer does so inside
+// the window it stays in jobs.json: the shorter of defaultTimerFiredRetention
+// and the time it takes defaultTimerFiredKeepMax newer timers to fire (a few
+// hours when timers fire by the thousand). After that, Get returns nil for the
+// id, exactly as for an id that never existed, so /timer/info and
+// `cc-connect timer info` answer "not found", and scripts reading jobs.json
+// no longer see it. A caller that treats "not found" as "done", or that looks
+// a fired timer up later than the window, gets the wrong answer. Anything
+// added that reads fired timers later must read the archive, or these limits
+// must grow to cover it.
+const (
+	// defaultTimerFiredRetention is how long a fired timer stays in jobs.json.
+	defaultTimerFiredRetention = 72 * time.Hour
+	// defaultTimerFiredKeepMax caps how many fired timers stay in jobs.json
+	// however recent they are, so a burst of timers cannot make each save
+	// slow again.
+	defaultTimerFiredKeepMax = 5000
+	// timerPruneInterval is how often saves look for fired timers to move.
+	timerPruneInterval = time.Hour
+	// defaultTimerArchiveKeepMonths is how many monthly archive files are
+	// kept: the current month's and the ones before it, this many in all.
+	// Older files are deleted when the store prunes. The archive is only
+	// appended to and nothing reads it back, so without a limit it grows
+	// forever (one busy deployment wrote about 117 MB in a month); six months
+	// is long enough to look back at how timers ran.
+	defaultTimerArchiveKeepMonths = 6
+)
+
 // TimerStore persists timer jobs to a JSON file.
 type TimerStore struct {
-	path string
-	mu   sync.Mutex
-	jobs []*TimerJob
+	path       string
+	archiveDir string
+	mu         sync.Mutex
+	jobs       []*TimerJob
+
+	firedRetention    time.Duration // 0 = no age limit
+	firedKeepMax      int           // 0 = no count limit
+	archiveKeepMonths int           // 0 = keep every archive file
+	lastPrune         time.Time
+	now               func() time.Time
 }
 
 func NewTimerStore(dataDir string) (*TimerStore, error) {
@@ -100,8 +143,22 @@ func NewTimerStore(dataDir string) (*TimerStore, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "jobs.json")
-	s := &TimerStore{path: path}
+	s := &TimerStore{
+		path:              path,
+		archiveDir:        filepath.Join(dir, "archive"),
+		firedRetention:    defaultTimerFiredRetention,
+		firedKeepMax:      defaultTimerFiredKeepMax,
+		archiveKeepMonths: defaultTimerArchiveKeepMonths,
+		now:               time.Now,
+	}
 	s.load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pruneLocked(s.now()) > 0 {
+		if err := s.save(); err != nil {
+			slog.Warn("timer: failed to save after archiving fired jobs", "error", err)
+		}
+	}
 	return s, nil
 }
 
@@ -115,7 +172,12 @@ func (s *TimerStore) load() {
 	}
 }
 
+// save writes jobs.json. At most once per timerPruneInterval it first moves
+// fired jobs past their retention to the archive, so s.jobs may shrink.
 func (s *TimerStore) save() error {
+	if now := s.now(); now.Sub(s.lastPrune) >= timerPruneInterval {
+		s.pruneLocked(now)
+	}
 	data, err := json.MarshalIndent(s.jobs, "", "  ")
 	if err != nil {
 		return err
@@ -221,6 +283,162 @@ func (s *TimerStore) Get(id string) *TimerJob {
 		}
 	}
 	return nil
+}
+
+// PruneFired moves fired jobs that are older than the retention window, or
+// beyond the newest firedKeepMax fired jobs, from jobs.json to the monthly
+// archive, and returns how many it moved. Pending jobs are never moved. It
+// also deletes archive files older than archiveKeepMonths.
+func (s *TimerStore) PruneFired(now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.pruneLocked(now)
+	if n == 0 {
+		return 0, nil
+	}
+	return n, s.save()
+}
+
+// pruneLocked drops the jobs PruneFired describes from s.jobs after
+// appending them to the archive. If the archive cannot be written the jobs
+// stay in jobs.json, so a job is never in neither place; a crash between
+// the append and the next save can leave it in both.
+func (s *TimerStore) pruneLocked(now time.Time) int {
+	s.lastPrune = now
+	s.dropOldArchivesLocked(now)
+	var fired []*TimerJob
+	for _, j := range s.jobs {
+		if j.Fired {
+			fired = append(fired, j)
+		}
+	}
+	sort.SliceStable(fired, func(a, b int) bool { return timerFiredTime(fired[a]).After(timerFiredTime(fired[b])) })
+	cutoff := now.Add(-s.firedRetention)
+	move := make(map[*TimerJob]bool)
+	for i, j := range fired {
+		if (s.firedKeepMax > 0 && i >= s.firedKeepMax) || (s.firedRetention > 0 && timerFiredTime(j).Before(cutoff)) {
+			move[j] = true
+		}
+	}
+	if len(move) == 0 {
+		return 0
+	}
+
+	var moved, kept []*TimerJob
+	for _, j := range s.jobs {
+		if move[j] {
+			moved = append(moved, j)
+		} else {
+			kept = append(kept, j)
+		}
+	}
+	if err := s.archive(moved); err != nil {
+		slog.Warn("timer: failed to archive fired jobs; keeping them in jobs.json", "count", len(moved), "error", err)
+		return 0
+	}
+	s.jobs = kept
+	slog.Info("timer: archived fired jobs", "count", len(moved), "kept", len(kept), "dir", s.archiveDir)
+	return len(moved)
+}
+
+// dropOldArchivesLocked deletes the monthly archive files (jobs-YYYY-MM.jsonl)
+// of months that are archiveKeepMonths or more before now's month. Files with
+// any other name are left alone; failures are logged, not returned.
+func (s *TimerStore) dropOldArchivesLocked(now time.Time) {
+	if s.archiveKeepMonths <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(s.archiveDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("timer: cannot list the archive", "dir", s.archiveDir, "error", err)
+		}
+		return
+	}
+	nowMonth := now.Year()*12 + int(now.Month()) - 1
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, "jobs-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		m, err := time.Parse("2006-01", strings.TrimSuffix(strings.TrimPrefix(name, "jobs-"), ".jsonl"))
+		if err != nil {
+			continue
+		}
+		if nowMonth-(m.Year()*12+int(m.Month())-1) < s.archiveKeepMonths {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.archiveDir, name)); err != nil {
+			slog.Warn("timer: cannot delete an old archive file", "file", name, "error", err)
+			continue
+		}
+		slog.Info("timer: deleted an archive file past its retention", "file", name, "keep_months", s.archiveKeepMonths)
+	}
+}
+
+// timerFiredTime is when a fired job fired, or when it was due if that was
+// not recorded.
+func timerFiredTime(j *TimerJob) time.Time {
+	if !j.FiredAt.IsZero() {
+		return j.FiredAt
+	}
+	return j.ScheduledAt
+}
+
+// archive appends jobs, one JSON object per line, to the archive file of the
+// month each one fired in.
+func (s *TimerStore) archive(jobs []*TimerJob) error {
+	if err := os.MkdirAll(s.archiveDir, 0o755); err != nil {
+		return err
+	}
+	byMonth := make(map[string][]byte)
+	var months []string
+	for _, j := range jobs {
+		line, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		m := timerFiredTime(j).Format("2006-01")
+		if _, ok := byMonth[m]; !ok {
+			months = append(months, m)
+		}
+		byMonth[m] = append(append(byMonth[m], line...), '\n')
+	}
+	sort.Strings(months)
+	for _, m := range months {
+		if err := appendTimerArchive(filepath.Join(s.archiveDir, "jobs-"+m+".jsonl"), byMonth[m]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func appendTimerArchive(path string, lines []byte) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	// An earlier append cut short leaves a partial last line; start on a new
+	// line so it does not swallow the first job of this batch.
+	if st, err := f.Stat(); err != nil {
+		return err
+	} else if st.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := f.ReadAt(last, st.Size()-1); err != nil {
+			return err
+		}
+		if last[0] != '\n' {
+			lines = append([]byte{'\n'}, lines...)
+		}
+	}
+	if _, err := f.Write(lines); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // ListPending returns all non-fired timer jobs.
