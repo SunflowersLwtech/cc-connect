@@ -3365,9 +3365,9 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 
 		default:
 			if isResourceMessageType(msgType) {
-				sb.WriteString(fmt.Sprintf("%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType))
+				fmt.Fprintf(sb, "%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType)
 			} else {
-				sb.WriteString(fmt.Sprintf("%s[%s] %s: %s\n", indent, ts, senderName, describeOtherMessage(msgType, content)))
+				fmt.Fprintf(sb, "%s[%s] %s: %s\n", indent, ts, senderName, describeOtherMessage(msgType, content))
 			}
 		}
 	}

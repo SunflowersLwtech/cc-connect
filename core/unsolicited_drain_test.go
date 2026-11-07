@@ -382,7 +382,7 @@ func TestUnsolicitedReader_NoReplyTurnStaysSilent(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("reader-noreply")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	defer e.Stop()
+	defer func() { _ = e.Stop() }()
 	key := "test:ch1:u1"
 	session := e.sessions.GetOrCreateActive(key)
 	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
@@ -509,7 +509,7 @@ func TestUnsolicitedReader_SplitsLongReply(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("reader-long")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	defer e.Stop()
+	defer func() { _ = e.Stop() }()
 	key := "test:ch1:u1"
 	session := e.sessions.GetOrCreateActive(key)
 	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
