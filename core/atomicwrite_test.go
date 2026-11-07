@@ -161,7 +161,7 @@ func TestAtomicWriteFile_CrossDeviceTempDirStillReplacesByRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	crossDir := simulateCrossDeviceTempDir(t, dir)
 	want := []byte("new content")
@@ -272,7 +272,9 @@ func TestRemoveStaleAtomicWriteTemps_RemovesOnlyOldTempsOfInterruptedWrites(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chtimes(tmp.Name(), old, old); err != nil {
 		t.Fatal(err)
 	}

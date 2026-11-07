@@ -146,7 +146,7 @@ func RemoveStaleAtomicWriteTemps(root string, minAge time.Duration) (int, error)
 	}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if !(path == root && errors.Is(err, fs.ErrNotExist)) {
+			if path != root || !errors.Is(err, fs.ErrNotExist) {
 				note(err)
 			}
 			return nil
