@@ -94,6 +94,17 @@ func validateTimerJob(j *TimerJob) error {
 // line) that is never read back. Without this every fired timer stays in
 // jobs.json forever, and every Add and MarkFired rewrites all of that history
 // while holding the store lock.
+//
+// This is only safe while everything that reads a fired timer does so inside
+// the window it stays in jobs.json: the shorter of defaultTimerFiredRetention
+// and the time it takes defaultTimerFiredKeepMax newer timers to fire (a few
+// hours when timers fire by the thousand). After that, Get returns nil for the
+// id, exactly as for an id that never existed, so /timer/info and
+// `cc-connect timer info` answer "not found", and scripts reading jobs.json
+// no longer see it. A caller that treats "not found" as "done", or that looks
+// a fired timer up later than the window, gets the wrong answer. Anything
+// added that reads fired timers later must read the archive, or these limits
+// must grow to cover it.
 const (
 	// defaultTimerFiredRetention is how long a fired timer stays in jobs.json.
 	defaultTimerFiredRetention = 72 * time.Hour
@@ -103,6 +114,13 @@ const (
 	defaultTimerFiredKeepMax = 5000
 	// timerPruneInterval is how often saves look for fired timers to move.
 	timerPruneInterval = time.Hour
+	// defaultTimerArchiveKeepMonths is how many monthly archive files are
+	// kept: the current month's and the ones before it, this many in all.
+	// Older files are deleted when the store prunes. The archive is only
+	// appended to and nothing reads it back, so without a limit it grows
+	// forever (one busy deployment wrote about 117 MB in a month); six months
+	// is long enough to look back at how timers ran.
+	defaultTimerArchiveKeepMonths = 6
 )
 
 // TimerStore persists timer jobs to a JSON file.
@@ -112,10 +130,11 @@ type TimerStore struct {
 	mu         sync.Mutex
 	jobs       []*TimerJob
 
-	firedRetention time.Duration // 0 = no age limit
-	firedKeepMax   int           // 0 = no count limit
-	lastPrune      time.Time
-	now            func() time.Time
+	firedRetention    time.Duration // 0 = no age limit
+	firedKeepMax      int           // 0 = no count limit
+	archiveKeepMonths int           // 0 = keep every archive file
+	lastPrune         time.Time
+	now               func() time.Time
 }
 
 func NewTimerStore(dataDir string) (*TimerStore, error) {
@@ -125,11 +144,12 @@ func NewTimerStore(dataDir string) (*TimerStore, error) {
 	}
 	path := filepath.Join(dir, "jobs.json")
 	s := &TimerStore{
-		path:           path,
-		archiveDir:     filepath.Join(dir, "archive"),
-		firedRetention: defaultTimerFiredRetention,
-		firedKeepMax:   defaultTimerFiredKeepMax,
-		now:            time.Now,
+		path:              path,
+		archiveDir:        filepath.Join(dir, "archive"),
+		firedRetention:    defaultTimerFiredRetention,
+		firedKeepMax:      defaultTimerFiredKeepMax,
+		archiveKeepMonths: defaultTimerArchiveKeepMonths,
+		now:               time.Now,
 	}
 	s.load()
 	s.mu.Lock()
@@ -267,7 +287,8 @@ func (s *TimerStore) Get(id string) *TimerJob {
 
 // PruneFired moves fired jobs that are older than the retention window, or
 // beyond the newest firedKeepMax fired jobs, from jobs.json to the monthly
-// archive, and returns how many it moved. Pending jobs are never moved.
+// archive, and returns how many it moved. Pending jobs are never moved. It
+// also deletes archive files older than archiveKeepMonths.
 func (s *TimerStore) PruneFired(now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -284,6 +305,7 @@ func (s *TimerStore) PruneFired(now time.Time) (int, error) {
 // the append and the next save can leave it in both.
 func (s *TimerStore) pruneLocked(now time.Time) int {
 	s.lastPrune = now
+	s.dropOldArchivesLocked(now)
 	var fired []*TimerJob
 	for _, j := range s.jobs {
 		if j.Fired {
@@ -317,6 +339,41 @@ func (s *TimerStore) pruneLocked(now time.Time) int {
 	s.jobs = kept
 	slog.Info("timer: archived fired jobs", "count", len(moved), "kept", len(kept), "dir", s.archiveDir)
 	return len(moved)
+}
+
+// dropOldArchivesLocked deletes the monthly archive files (jobs-YYYY-MM.jsonl)
+// of months that are archiveKeepMonths or more before now's month. Files with
+// any other name are left alone; failures are logged, not returned.
+func (s *TimerStore) dropOldArchivesLocked(now time.Time) {
+	if s.archiveKeepMonths <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(s.archiveDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("timer: cannot list the archive", "dir", s.archiveDir, "error", err)
+		}
+		return
+	}
+	nowMonth := now.Year()*12 + int(now.Month()) - 1
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, "jobs-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		m, err := time.Parse("2006-01", strings.TrimSuffix(strings.TrimPrefix(name, "jobs-"), ".jsonl"))
+		if err != nil {
+			continue
+		}
+		if nowMonth-(m.Year()*12+int(m.Month())-1) < s.archiveKeepMonths {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.archiveDir, name)); err != nil {
+			slog.Warn("timer: cannot delete an old archive file", "file", name, "error", err)
+			continue
+		}
+		slog.Info("timer: deleted an archive file past its retention", "file", name, "keep_months", s.archiveKeepMonths)
+	}
 }
 
 // timerFiredTime is when a fired job fired, or when it was due if that was

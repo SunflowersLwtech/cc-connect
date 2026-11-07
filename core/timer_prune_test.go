@@ -329,3 +329,47 @@ func TestTimerStore_PruneRunsDuringSaves(t *testing.T) {
 		t.Errorf("archive holds %d lines, want 1", n)
 	}
 }
+
+// The archive is never read back, so its monthly files are kept for
+// archiveKeepMonths (this month and the ones before it, that many in all) and
+// older ones are deleted when the store prunes, whether or not that prune
+// moves any job. Nothing else in the directory is touched.
+func TestTimerStore_PruneDeletesArchiveFilesPastRetention(t *testing.T) {
+	dataDir := t.TempDir()
+	s, err := NewTimerStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveDir := filepath.Join(dataDir, "timers", "archive")
+	if err := os.MkdirAll(filepath.Join(archiveDir, "jobs-2020-01.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"jobs-2026-11.jsonl", "jobs-2026-06.jsonl", // this month and the oldest kept
+		"jobs-2026-05.jsonl", "jobs-2025-12.jsonl", // past retention
+		"jobs-2026-13.jsonl", "jobs-2024-01.jsonl.bak", "notes.txt", // not archive files
+	} {
+		if err := os.WriteFile(filepath.Join(archiveDir, name), []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, time.November, 8, 12, 0, 0, 0, time.UTC)
+	if moved, err := s.PruneFired(now); err != nil || moved != 0 {
+		t.Fatalf("PruneFired = %d, %v; want 0, nil", moved, err)
+	}
+
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for _, e := range entries {
+		left = append(left, e.Name())
+	}
+	sort.Strings(left)
+	want := []string{"jobs-2020-01.jsonl", "jobs-2024-01.jsonl.bak", "jobs-2026-06.jsonl", "jobs-2026-11.jsonl", "jobs-2026-13.jsonl", "notes.txt"}
+	if strings.Join(left, " ") != strings.Join(want, " ") {
+		t.Fatalf("archive holds %v, want %v", left, want)
+	}
+}
