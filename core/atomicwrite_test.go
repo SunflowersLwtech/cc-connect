@@ -2,14 +2,17 @@ package core
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestAtomicWriteFile_Basic(t *testing.T) {
@@ -119,11 +122,19 @@ func TestAtomicWriteFile_NoTempLeftWhenRenameFails(t *testing.T) {
 // bind mount. It returns a counter of those failed attempts.
 func simulateCrossDeviceTempDir(t *testing.T, dir string) *atomic.Int32 {
 	t.Helper()
+	return failRenamesFromOtherDirs(t, dir, errCrossDevice)
+}
+
+// failRenamesFromOtherDirs makes renames from another directory into dir fail
+// with errno, wrapped the way os.Rename wraps it, and returns a counter of
+// those failed attempts.
+func failRenamesFromOtherDirs(t *testing.T, dir string, errno error) *atomic.Int32 {
+	t.Helper()
 	var crossDir atomic.Int32
 	hook := func(oldpath, newpath string) error {
 		if filepath.Dir(newpath) == dir && filepath.Dir(oldpath) != dir {
 			crossDir.Add(1)
-			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: errors.New("invalid cross-device link")}
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: errno}
 		}
 		return os.Rename(oldpath, newpath)
 	}
@@ -201,5 +212,151 @@ func TestAtomicWriteFile_CrossDeviceRemembersDirectory(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(path); string(got) != "2" {
 		t.Fatalf("path holds %q, want %q", got, "2")
+	}
+}
+
+// Only a cross-device failure says something about the directory. Any other
+// failed rename from the system temp dir falls back to a temp file next to
+// the target for that write, but must not make later writes skip the system
+// temp dir: same-filesystem setups must never keep writing temp files next to
+// their targets.
+func TestAtomicWriteFile_OtherRenameErrorsAreNotRemembered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jobs.json")
+	failed := failRenamesFromOtherDirs(t, dir, fs.ErrPermission)
+
+	for i := 0; i < 3; i++ {
+		if err := AtomicWriteFile(path, []byte(fmt.Sprint(i)), 0o644); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if got, _ := os.ReadFile(path); string(got) != fmt.Sprint(i) {
+			t.Fatalf("after write %d path holds %q", i, got)
+		}
+	}
+	if n := failed.Load(); n != 3 {
+		t.Fatalf("renamed from the system temp dir %d times over 3 writes, want 3: a non-cross-device failure was remembered for the directory", n)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != "jobs.json" {
+			t.Errorf("unexpected file left: %s", e.Name())
+		}
+	}
+}
+
+// A process killed between writing the temp file next to a store and renaming
+// it leaves that file behind. RemoveStaleAtomicWriteTemps removes exactly
+// those, anywhere under the data directory, once they are older than minAge,
+// and nothing else.
+func TestRemoveStaleAtomicWriteTemps_RemovesOnlyOldTempsOfInterruptedWrites(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-2 * time.Hour)
+	write := func(rel string, mtime time.Time) string {
+		t.Helper()
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// A temp file named exactly the way AtomicWriteFile names it.
+	jobs := write("timers/jobs.json", old)
+	tmp, err := os.CreateTemp(filepath.Dir(jobs), sameDirTempPattern(jobs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	if err := os.Chtimes(tmp.Name(), old, old); err != nil {
+		t.Fatal(err)
+	}
+	stale := []string{
+		filepath.Join("timers", filepath.Base(tmp.Name())),
+		filepath.Join("sessions", ".assistant_c6ee6a37.json.tmp-42"),
+		".daemon.json.tmp-9",
+	}
+	write(stale[1], old)
+	write(stale[2], old)
+
+	keep := []string{
+		"timers/jobs.json",
+		"timers/.jobs.json.tmp-777",    // being written right now
+		"timers/.jobs.json.tmp-abc",    // not a CreateTemp suffix
+		"timers/jobs.json.tmp-1",       // no leading dot
+		".tmp-5",                       // no base name
+		"run/cc-atomic-12",             // the system temp dir pattern
+		"projects/notes.tmp-1.txt",     // .tmp- in the middle
+		"weixin/p/a/.sync.json.tmp-x1", // digits not at the end
+	}
+	for _, rel := range keep {
+		mtime := old
+		if rel == "timers/.jobs.json.tmp-777" {
+			mtime = time.Now()
+		}
+		write(rel, mtime)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "projects", ".x.tmp-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(root, "projects", ".x.tmp-1"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	keep = append(keep, "projects/.x.tmp-1")
+	if runtime.GOOS != "windows" {
+		outside := filepath.Join(t.TempDir(), "outside")
+		if err := os.WriteFile(outside, []byte("keep me"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(root, ".link.json.tmp-3")); err != nil {
+			t.Fatal(err)
+		}
+		keep = append(keep, ".link.json.tmp-3")
+		defer func() {
+			if got, err := os.ReadFile(outside); err != nil || string(got) != "keep me" {
+				t.Errorf("the file a symlink points to was touched: %q, %v", got, err)
+			}
+		}()
+	}
+
+	n, err := RemoveStaleAtomicWriteTemps(root, time.Minute)
+	if err != nil {
+		t.Fatalf("RemoveStaleAtomicWriteTemps: %v", err)
+	}
+	if n != len(stale) {
+		t.Errorf("removed %d files, want %d", n, len(stale))
+	}
+
+	var left []string
+	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == root || (d.IsDir() && d.Name() != ".x.tmp-1") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		left = append(left, filepath.ToSlash(rel))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(left)
+	want := append([]string(nil), keep...)
+	sort.Strings(want)
+	if strings.Join(left, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("left behind:\n  %s\nwant:\n  %s", strings.Join(left, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+func TestRemoveStaleAtomicWriteTemps_MissingDirectory(t *testing.T) {
+	n, err := RemoveStaleAtomicWriteTemps(filepath.Join(t.TempDir(), "never-created"), time.Minute)
+	if n != 0 || err != nil {
+		t.Fatalf("got %d, %v; want 0, nil", n, err)
 	}
 }

@@ -346,6 +346,17 @@ func main() {
 
 	setupLogger(cfg.Log.Level, logWriter)
 
+	// When the data directory is on another filesystem than os.TempDir(),
+	// core.AtomicWriteFile writes its temp file next to the store it replaces;
+	// a process killed before the rename leaves it there for good. Remove
+	// those before any store is opened (this instance holds the lock, so none
+	// of them is ours in flight).
+	if n, err := core.RemoveStaleAtomicWriteTemps(cfg.DataDir, time.Minute); err != nil {
+		slog.Warn("could not remove all leftover temp files from the data directory", "dir", cfg.DataDir, "removed", n, "error", err)
+	} else if n > 0 {
+		slog.Info("removed leftover temp files of interrupted writes", "dir", cfg.DataDir, "count", n)
+	}
+
 	// run_as_user preflight + isolation audit. MUST run before any engine
 	// or agent is constructed. If any project fails, abort startup
 	// entirely — never half-spawn. See core/runas_check.go and
