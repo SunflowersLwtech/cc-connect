@@ -178,10 +178,90 @@ func TestOnMessage_HangingUserLookupDoesNotSwallowMessage(t *testing.T) {
 	}
 }
 
+// While the name lookups hang, a card press or a message waits for them only
+// once: both names are looked up at the same time (one nameLookupTimeout, not
+// two), and the failed lookups are remembered, so the next press is not held
+// again. With the default 5 s timeout that is: the first press reaches the
+// engine after about 5 s instead of 10, the second at once instead of after 10.
+func TestNameLookups_HangingAPIHoldsOnlyTheFirstDispatch(t *testing.T) {
+	const timeout = time.Second
+	setNameLookupTimeout(t, timeout)
+	for _, tc := range []struct {
+		name string
+		send func(p *Platform, n int) error
+	}{
+		{"card button", func(p *Platform, n int) error {
+			_, err := p.onCardAction(cardActionEvent("ou_alice", "cmd:/help"))
+			return err
+		}},
+		{"text message", func(p *Platform, n int) error {
+			return p.onMessage(context.Background(), p2pTextEvent("om_"+strconv.Itoa(n), "oc_test_chat", "ou_alice", "hi"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ls := newLookupServer(t, lookupHang, lookupHang)
+			got := make(chan *core.Message, 4)
+			p := ls.platform(func(_ core.Platform, msg *core.Message) { got <- msg })
+
+			for i, limit := range []time.Duration{timeout * 3 / 2, timeout / 2} {
+				start := time.Now()
+				if err := tc.send(p, i); err != nil {
+					t.Fatalf("send %d: %v", i+1, err)
+				}
+				select {
+				case msg := <-got:
+					if elapsed := time.Since(start); elapsed > limit {
+						t.Fatalf("send %d reached the engine after %s, want within %s (user lookups=%d, chat lookups=%d)",
+							i+1, elapsed.Round(time.Millisecond), limit, ls.userCalls.Load(), ls.chatCalls.Load())
+					}
+					if msg.UserName != "ou_alice" || msg.ChatName != "oc_test_chat" {
+						t.Fatalf("send %d: UserName/ChatName = %q/%q, want ID fallbacks", i+1, msg.UserName, msg.ChatName)
+					}
+				case <-time.After(4 * timeout):
+					t.Fatalf("send %d never reached the engine handler", i+1)
+				}
+			}
+			if u, c := ls.userCalls.Load(), ls.chatCalls.Load(); u != 1 || c != 1 {
+				t.Fatalf("lookups = %d user, %d chat after two sends; want 1 each, the failures remembered", u, c)
+			}
+		})
+	}
+}
+
+// A failed lookup is remembered only for nameLookupFailureTTL; after that the
+// name is looked up again, so names come back once the API does.
+func TestResolveNames_RequestFailureRememberedForTTL(t *testing.T) {
+	setNameLookupTimeout(t, 100*time.Millisecond)
+	oldTTL := nameLookupFailureTTL
+	nameLookupFailureTTL = 400 * time.Millisecond
+	t.Cleanup(func() { nameLookupFailureTTL = oldTTL })
+	ls := newLookupServer(t, lookupHang, lookupHang)
+	p := ls.platform(nil)
+
+	resolve := func() {
+		t.Helper()
+		if u, c := p.resolveNames("ou_alice", "oc_x"); u != "ou_alice" || c != "oc_x" {
+			t.Fatalf("resolveNames() = %q, %q; want the ID fallbacks", u, c)
+		}
+	}
+	resolve()
+	resolve()
+	if u, c := ls.userCalls.Load(), ls.chatCalls.Load(); u != 1 || c != 1 {
+		t.Fatalf("lookups = %d user, %d chat within the TTL; want 1 each", u, c)
+	}
+	time.Sleep(nameLookupFailureTTL + 2*nameLookupTimeout)
+	resolve()
+	if u, c := ls.userCalls.Load(), ls.chatCalls.Load(); u != 2 || c != 2 {
+		t.Fatalf("lookups = %d user, %d chat after the TTL; want 2 each, looked up again", u, c)
+	}
+}
+
 // Feishu returns no name for p2p chats. That answer is final, so it must be
 // cached; otherwise every DM pays a network round-trip on the dispatch path
 // (and inside the card-callback window) for the lifetime of the process.
-// Errors stay uncached so a transient failure can still be retried.
+// An answer with an error code stays uncached so it is retried at once (a
+// request that fails outright is remembered briefly, see
+// TestResolveNames_RequestFailureRememberedForTTL).
 func TestResolveChatName_Caching(t *testing.T) {
 	cases := []struct {
 		name      string

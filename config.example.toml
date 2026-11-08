@@ -210,6 +210,23 @@ level = "info" # debug, info, warn, error
 # [[projects]]
 # model_fallback_action = "notify"
 
+# What the chat gets when the agent refuses a turn because a usage limit has
+# been reached (Claude Code, e.g. its session or weekly limit). Unset (default),
+# the agent's own refusal text goes out every time. Set, this text goes out
+# instead, once per limit episode: later refusals in the same episode get a
+# one-line "queued" notice, until a turn gets an answer or the announced reset
+# time passes. {reset_at} becomes the reset time ("15:04", or "01-02 15:04"
+# when not today), or "later" in the user's language when it is unknown.
+# The turn.usage_limited hook fires for every refusal either way.
+# agent 因额度用完拒绝一轮时（Claude Code，例如会话额度、每周额度），聊天里发什么。
+# 不设置（默认）时每次都原样发 agent 自己的拒绝文字。设置后改发这段文字，每个额度周期只发
+# 一次：同一周期里之后再被拒，只回一行「已排队」，直到有一轮正常回答或提示的恢复时间已过。
+# {reset_at} 换成恢复时间（当天为「15:04」，否则为「01-02 15:04」），不知道时换成用户
+# 语言里的「稍后」。无论是否设置，每次被拒都会触发 turn.usage_limited 钩子。
+# 例如 / e.g.: usage_limit_reply = "⏳ 额度用完了，约 {reset_at} 恢复"
+# [[projects]]
+# usage_limit_reply = "⏳ Usage limit reached; it resets at {reset_at}."
+
 # Close an idle live agent process after a clean turn while preserving the
 # cc-connect session and saved agent session ID. The next message in the same
 # chat/thread starts a new agent process and resumes the same conversation.
