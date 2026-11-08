@@ -444,6 +444,24 @@ type Engine struct {
 	autoCompressAllowHeuristic bool
 	resetOnIdle                time.Duration
 
+	// modelFallbackAction is what happens after the agent moves a session to
+	// another model on its own (a safeguards fallback): ModelFallbackNotify
+	// tells the user and offers the ways back; ModelFallbackRestore also
+	// switches back once the turn's reply is out. modelRestoreLoopWindow
+	// overrides defaultModelRestoreLoopWindow (tests).
+	modelFallbackAction    string
+	modelRestoreLoopWindow time.Duration
+
+	// usageLimitReply replaces the agent's refusal text when a turn is
+	// refused for a usage limit (empty: send the agent's text).
+	usageLimitReply string
+	// usageLimitNotified is set once usageLimitReply has gone out for the
+	// current limit episode; usageLimitNotifiedUntil is the reset time that
+	// reply announced (zero: until a turn gets an answer).
+	usageLimitMu            sync.Mutex
+	usageLimitNotified      bool
+	usageLimitNotifiedUntil time.Time
+
 	// Reply footer composition flags. The footer renders up to two lines:
 	//   line 1 — model · [effort ·] out/in/cw/cr · ctx%   (gated by showContextIndicator)
 	//   line 2 — workspace directory                       (gated by showWorkdirIndicator)
@@ -578,6 +596,13 @@ type interactiveState struct {
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
+
+	// pendingModelRestore is a safeguards fallback to undo once the current
+	// turn's reply is out (model_fallback_action = "restore").
+	pendingModelRestore *ModelSwitch
+	// lastModelRestoreAt is when this session was last switched back after a
+	// fallback; another fallback within the loop window is left in place.
+	lastModelRestoreAt time.Time
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -984,6 +1009,64 @@ func (e *Engine) SetResetOnIdle(d time.Duration) {
 		return
 	}
 	e.resetOnIdle = d
+}
+
+// Values of model_fallback_action.
+const (
+	ModelFallbackNotify  = "notify"
+	ModelFallbackRestore = "restore"
+)
+
+// defaultModelRestoreLoopWindow is how long after switching a session back
+// another fallback is left in place instead of being undone again.
+const defaultModelRestoreLoopWindow = 30 * time.Minute
+
+// modelRestoreTimeout bounds the wait for the agent to acknowledge a switch.
+const modelRestoreTimeout = 15 * time.Second
+
+// SetModelFallbackAction configures what happens after the agent moves a
+// session to another model on its own. Anything other than "restore" means
+// "notify".
+func (e *Engine) SetModelFallbackAction(action string) {
+	if strings.EqualFold(strings.TrimSpace(action), ModelFallbackRestore) {
+		e.modelFallbackAction = ModelFallbackRestore
+		return
+	}
+	e.modelFallbackAction = ModelFallbackNotify
+}
+
+// reportUsageLimit emits turn.usage_limited for a turn the provider refused,
+// so a hook can hand the user's message to someone who can still answer it.
+// Extra: in_reply_to (the user message that started the turn), prompt (as the
+// agent was sent it, attachment paths included), limit_text, resets_at, and
+// reply (the configured text the user got instead, when one was sent).
+func (e *Engine) reportUsageLimit(p Platform, sessionKey, msgID string, event Event, reply string) {
+	extra := map[string]any{"limit_text": event.Content, "prompt": event.UsageLimit.Prompt}
+	if msgID != "" {
+		extra["in_reply_to"] = msgID
+	}
+	if !event.UsageLimit.ResetsAt.IsZero() {
+		extra["resets_at"] = event.UsageLimit.ResetsAt.UTC().Format(time.RFC3339)
+	}
+	if reply != "" {
+		extra["reply"] = reply // what the user was told instead
+	}
+	slog.Warn("turn refused for a usage limit", "session", sessionKey, "msg_id", msgID, "resets_at", extra["resets_at"])
+	e.hooks.Emit(HookEvent{Event: HookEventUsageLimited, SessionKey: sessionKey, Platform: p.Name(), Extra: extra})
+}
+
+// SetUsageLimitReply sets the text sent instead of the agent's refusal when a
+// turn is refused because a usage limit has been reached; empty keeps the
+// agent's own text.
+func (e *Engine) SetUsageLimitReply(text string) {
+	e.usageLimitReply = strings.TrimSpace(text)
+}
+
+func (e *Engine) modelRestoreWindow() time.Duration {
+	if e.modelRestoreLoopWindow > 0 {
+		return e.modelRestoreLoopWindow
+	}
+	return defaultModelRestoreLoopWindow
 }
 
 // SetAgentSessionIdleTimeout 配置单轮正常结束后的 live agent 空闲关闭时间。
@@ -1876,9 +1959,10 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
+		session.takeUsageLimit()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
-		return nil
+		return timerUsageLimitErr(session)
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
@@ -1891,7 +1975,19 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
+	session.takeUsageLimit()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
+	return timerUsageLimitErr(session)
+}
+
+// timerUsageLimitErr turns a refusal recorded during a timer run into the
+// job's error. The run may include messages queued behind the job's own
+// turn; a refusal of any of them counts, which can only make the job look
+// unanswered when it was answered, never the other way round.
+func timerUsageLimitErr(session *Session) error {
+	if l := session.takeUsageLimit(); l != nil {
+		return &UsageLimitError{ResetsAt: l.ResetsAt}
+	}
 	return nil
 }
 
@@ -3612,9 +3708,27 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 				"session", msg.SessionKey, "content", content)
 			return true
 		}
+		// Same for an AskUserQuestion option click that arrives after its
+		// question was answered some other way (e.g. by a chat message), or
+		// after a restart: forwarding "askq:0:1" as user input would queue
+		// it for the agent as literal text.
+		if _, _, ok := parseAskQuestionCallback(content); ok {
+			e.dropStaleAskQuestionCallback(p, msg, content)
+			return true
+		}
 		return false
 	}
 found:
+
+	// An option click from an AskUserQuestion card is never a permission
+	// decision, and a click on an earlier question's card must not answer
+	// the question being asked now.
+	if qIdx, hasQIdx, ok := parseAskQuestionCallback(content); ok {
+		if len(pending.Questions) == 0 || (hasQIdx && qIdx != pending.CurrentQuestion) {
+			e.dropStaleAskQuestionCallback(p, msg, content)
+			return true
+		}
+	}
 
 	// AskUserQuestion: interpret user response as an answer, not a permission decision
 	if len(pending.Questions) > 0 {
@@ -3724,6 +3838,40 @@ func (e *Engine) lookupPending(iKey string) (*interactiveState, *pendingPermissi
 	pending := state.pending
 	state.mu.Unlock()
 	return state, pending
+}
+
+// parseAskQuestionCallback recognizes the value an AskUserQuestion option
+// button sends back: "askq:qIdx:optIdx", or the legacy "askq:optIdx".
+// hasQIdx reports whether the question index was present. ok is false for
+// anything else, including free text that merely starts with "askq:".
+func parseAskQuestionCallback(content string) (qIdx int, hasQIdx bool, ok bool) {
+	rest, found := strings.CutPrefix(strings.TrimSpace(content), "askq:")
+	if !found {
+		return 0, false, false
+	}
+	parts := strings.Split(rest, ":")
+	for _, part := range parts {
+		if n, err := strconv.Atoi(part); err != nil || n < 0 {
+			return 0, false, false
+		}
+	}
+	switch len(parts) {
+	case 1:
+		return 0, false, true
+	case 2:
+		qIdx, _ = strconv.Atoi(parts[0])
+		return qIdx, true, true
+	}
+	return 0, false, false
+}
+
+// dropStaleAskQuestionCallback tells the user that an option click arrived
+// for a question that is no longer waiting for an answer, instead of passing
+// the click on to the agent.
+func (e *Engine) dropStaleAskQuestionCallback(p Platform, msg *Message, content string) {
+	slog.Info("dropping stale ask-question callback",
+		"session", msg.SessionKey, "content", content)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionStale))
 }
 
 // resolveAskQuestionAnswer converts user input into answer text.
@@ -5073,18 +5221,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					"session", sessionKey,
 					"status", event.ToolStatus)
 
+			case EventModelSwitch:
+				e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
+
 			case EventResult:
-				fullResponse := event.Content
-				if fullResponse == "" && len(textParts) > 0 {
-					fullResponse = strings.Join(textParts, "")
-				}
-
-				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-						e.send(p, replyCtx, chunk)
-					}
-				}
-
 				// Safety note: concurrent writes to session.History by the
 				// unsolicited reader and a foreground turn cannot overlap.
 				// Session.AddHistory takes session.mu internally, and
@@ -5092,8 +5232,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
-				session.AddHistory("assistant", fullResponse)
-				sessions.Save()
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, sessionKey, event, textParts)
+
+				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
 
 				// Reset for potential subsequent unsolicited turn.
 				textParts = nil
@@ -5175,6 +5316,134 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			}
 		}
 	}
+}
+
+// modelSwitchCategory renders the refusal category as a suffix for notices.
+func modelSwitchCategory(ms *ModelSwitch) string {
+	if ms.Category == "" {
+		return ""
+	}
+	return " [" + ms.Category + "]"
+}
+
+// modelFallbackKeepAction is the card action of the "keep current" button.
+const modelFallbackKeepAction = "/model-fallback-keep"
+
+// relayModelSwitch tells the user that the agent moved to another model on its
+// own. Without it the reply footer is the only place the new model shows up,
+// and a session that quietly continues on a weaker model looks like a quality
+// regression rather than a deliberate fallback.
+//
+// When the whole session moved, the user is offered the ways back (switch back
+// with /model, start over with /new, or keep it). With model_fallback_action =
+// "restore" and an agent that can switch in place, the session is instead
+// switched back once this turn's reply is out, unless it was already switched
+// back within the loop window: then a fallback that keeps recurring is left in
+// place and the choice goes to the user.
+func (e *Engine) relayModelSwitch(p Platform, replyCtx any, sessionKey string, state *interactiveState, ms *ModelSwitch) {
+	if ms == nil || ms.From == "" || ms.To == "" || ms.From == ms.To {
+		return
+	}
+	slog.Warn("agent switched model on its own",
+		"session", sessionKey,
+		"from", ms.From,
+		"to", ms.To,
+		"reason", ms.Reason,
+		"category", ms.Category,
+		"session_wide", ms.SessionWide)
+	category := modelSwitchCategory(ms)
+	if !ms.SessionWide {
+		e.send(p, replyCtx, e.i18n.Tf(MsgModelSwitchResponse, ms.From, category, ms.To))
+		return
+	}
+
+	if e.modelFallbackAction == ModelFallbackRestore && state != nil {
+		state.mu.Lock()
+		_, canSwitch := state.agentSession.(LiveModelSetter)
+		last := state.lastModelRestoreAt
+		looping := !last.IsZero() && time.Since(last) < e.modelRestoreWindow()
+		if canSwitch && !looping {
+			state.pendingModelRestore = ms
+		}
+		state.mu.Unlock()
+		switch {
+		case canSwitch && !looping:
+			e.send(p, replyCtx, e.i18n.Tf(MsgModelSwitchRestoring, ms.From, category, ms.To))
+			return
+		case looping:
+			slog.Warn("model fallback recurred soon after switching back; leaving it in place",
+				"session", sessionKey, "last_restore", last, "window", e.modelRestoreWindow())
+			mins := int(e.modelRestoreWindow() / time.Minute)
+			e.sendModelSwitchOptions(p, replyCtx, e.i18n.Tf(MsgModelSwitchLoop, ms.From, category, ms.To, mins), ms)
+			return
+		}
+	}
+	e.sendModelSwitchOptions(p, replyCtx, e.i18n.Tf(MsgModelSwitchSession, ms.From, category, ms.To), ms)
+}
+
+// sendModelSwitchOptions sends text followed by the ways back from a
+// session-wide model switch: buttons on platforms that render cards or inline
+// buttons, the commands as text elsewhere. The buttons run the existing
+// /model and /new commands.
+func (e *Engine) sendModelSwitchOptions(p Platform, replyCtx any, text string, ms *ModelSwitch) {
+	restore := "/model switch " + ms.From
+	if supportsCards(p) {
+		card := NewCard().
+			Title(e.i18n.T(MsgModelSwitchCardTitle), "orange").
+			Markdown(text).
+			Buttons(
+				PrimaryBtn(e.i18n.Tf(MsgModelSwitchBtnRestore, ms.From), "cmd:"+restore),
+				DefaultBtn(e.i18n.T(MsgModelSwitchBtnNew), "cmd:/new"),
+				DefaultBtn(e.i18n.T(MsgModelSwitchBtnKeep), "act:"+modelFallbackKeepAction+" "+ms.To),
+			).
+			Build()
+		e.sendWithCard(p, replyCtx, card)
+		return
+	}
+	text += "\n" + e.i18n.Tf(MsgModelSwitchCommands, ms.From)
+	if _, ok := p.(InlineButtonSender); ok {
+		e.replyWithButtons(p, replyCtx, text, [][]ButtonOption{{
+			{Text: e.i18n.Tf(MsgModelSwitchBtnRestore, ms.From), Data: "cmd:" + restore},
+			{Text: e.i18n.T(MsgModelSwitchBtnNew), Data: "cmd:/new"},
+		}})
+		return
+	}
+	e.send(p, replyCtx, text)
+}
+
+// restoreModelAfterFallback switches the session back to the model it ran on
+// before a safeguards fallback, if relayModelSwitch arranged it for this
+// turn. It runs after the turn's reply has been delivered and before the next
+// queued message is sent. The declined request is not sent again.
+func (e *Engine) restoreModelAfterFallback(p Platform, replyCtx any, sessionKey string, state *interactiveState) {
+	state.mu.Lock()
+	ms := state.pendingModelRestore
+	state.pendingModelRestore = nil
+	agentSession := state.agentSession
+	state.mu.Unlock()
+	if ms == nil {
+		return
+	}
+
+	var err error
+	if setter, ok := agentSession.(LiveModelSetter); ok {
+		ctx, cancel := context.WithTimeout(e.ctx, modelRestoreTimeout)
+		err = setter.SetLiveModel(ctx, ms.From)
+		cancel()
+	} else {
+		err = fmt.Errorf("the agent session cannot switch models in place")
+	}
+	if err != nil {
+		slog.Warn("could not switch back after model fallback", "session", sessionKey, "model", ms.From, "error", err)
+		e.sendModelSwitchOptions(p, replyCtx, e.i18n.Tf(MsgModelRestoreFailed, ms.From, err, ms.To), ms)
+		return
+	}
+
+	state.mu.Lock()
+	state.lastModelRestoreAt = time.Now()
+	state.mu.Unlock()
+	slog.Info("switched back after model fallback", "session", sessionKey, "model", ms.From, "fallback", ms.To)
+	e.send(p, replyCtx, e.i18n.Tf(MsgModelRestored, ms.From))
 }
 
 type agentErrorHandler struct {
@@ -5437,6 +5706,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventModelSwitch:
+			e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
+
 		case EventHookRejected:
 			// Claude Code emits this between a Stop-hook-rejected draft and its
 			// rewritten answer. Discard only per-segment assistant text state so
@@ -6004,6 +6276,30 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
+			if event.UsageLimit != nil {
+				session.noteUsageLimit(event.UsageLimit)
+				reply, silent := e.usageLimitReplyFor(event)
+				switch {
+				case silent:
+					// Already announced this episode. The refusal may have
+					// streamed in as text; none of it goes out. Stay visible
+					// instead of silent: a silent turn's orphaned streaming
+					// card gets deleted, and Lark renders that as
+					// "recalled a message" — one short line is cheaper than a
+					// retraction the user reads as data loss.
+					fullResponse = e.i18n.T(MsgUsageLimitQueued)
+					partialText = ""
+					cardAnswerText.Reset()
+					reply = ""
+				case e.usageLimitReply == "":
+					reply = "" // the agent's own text goes out
+				default:
+					fullResponse = reply
+				}
+				e.reportUsageLimit(p, sessionKey, msgID, event, reply)
+			} else {
+				e.usageLimitCleared()
+			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
 			// leak into the delivered text. The on-screen ctx indicator is now
@@ -6360,6 +6656,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
 			}
 
+			// A safeguards fallback in this turn: switch back now that the
+			// reply is out, before a queued message reaches the agent.
+			e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
+
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
 				compressor, ok := e.agent.(ContextCompressor)
@@ -6425,10 +6725,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// Agent continues working — don't add done reaction for this turn.
 				doneReaction = nil
 
-				// Drain stale events before starting the next turn. Between
-				// EventResult and Send(), the only buffered events would be
-				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
-				drainEvents(state.agentSession.Events())
+				// Clear the buffer before starting the next turn. Besides
+				// stale leftovers (e.g. a deferred EventError from cmd.Wait())
+				// it can hold a turn the agent ran on its own while this
+				// turn's reply was being delivered; that one is relayed to
+				// where this turn's reply went.
+				e.drainBufferedTurns(state.agentSession.Events(), state, session, sessions, sessionKey, p, replyCtx)
 
 				if pendingSend != nil {
 					if err := <-pendingSend; err != nil {
@@ -6757,6 +7059,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 		queued := state.pendingMessages[0]
 		state.pendingMessages = state.pendingMessages[1:]
+		prevPlatform, prevReplyCtx := state.platform, state.replyCtx
+		if prevPlatform == nil {
+			prevPlatform, prevReplyCtx = queued.platform, queued.replyCtx
+		}
 		state.platform = queued.platform
 		state.replyCtx = queued.replyCtx
 		state.currentMessageID = queued.messageID
@@ -6776,7 +7082,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
-		drainEvents(as.Events())
+		e.drainBufferedTurns(as.Events(), state, session, sessions, sessionKey, prevPlatform, prevReplyCtx)
 
 		session.AddHistory("user", queued.content)
 
@@ -10855,11 +11161,15 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	e.stopUnsolicitedReader(state)
 
 	state.mu.Lock()
+	prevPlatform, prevReplyCtx := state.platform, state.replyCtx
+	if prevPlatform == nil {
+		prevPlatform, prevReplyCtx = p, replyCtx
+	}
 	state.platform = p
 	state.replyCtx = replyCtx
 	state.mu.Unlock()
 
-	drainEvents(state.agentSession.Events())
+	e.drainBufferedTurns(state.agentSession.Events(), state, session, sessions, iKey, prevPlatform, prevReplyCtx)
 
 	compressor, ok := e.agent.(ContextCompressor)
 	if !ok || compressor.CompressCommand() == "" {
@@ -12436,6 +12746,166 @@ func drainEvents(ch <-chan Event) {
 	}
 }
 
+// drainBufferedTurns empties the event channel before the engine gives the
+// agent its next input (a queued message, or the compress command).
+//
+// The buffer does not only hold leftovers of the turn that just ended (e.g. a
+// deferred EventError from cmd.Wait()). While the engine is still delivering
+// the previous reply, the agent can run a whole turn on its own (Claude Code
+// does when a background task notification arrives), and nothing reads those
+// events until the next turn starts. drainEvents threw that reply away. Here
+// every turn that is complete in the buffer, i.e. ends in a terminal
+// EventResult, is delivered the way the unsolicited reader delivers one, and
+// model switch notices are relayed. A turn stopped at a permission request is
+// answered, so the agent does not stay blocked behind the queued message.
+// Everything else is discarded as before:
+// errors, and the start of a turn the agent is still running (the rest of
+// that turn reaches the next turn's event loop).
+//
+// p and replyCtx must be those of the previous turn, which is where the
+// unsolicited reader would have delivered this output.
+func (e *Engine) drainBufferedTurns(ch <-chan Event, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any) {
+	var textParts []string
+	pending := 0 // events of the turn not yet completed
+	dropped := 0
+	defer func() {
+		dropped += pending
+		if dropped > 0 {
+			slog.Warn("drained stale events from previous turn", "session", sessionKey, "count", dropped)
+		}
+	}()
+	for {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			switch {
+			case event.Type == EventResult && event.Done:
+				fullResponse := e.deliverUnsolicitedResult(p, replyCtx, session, sessions, sessionKey, event, textParts)
+				e.restoreModelAfterFallback(p, replyCtx, sessionKey, state)
+				slog.Info("unsolicited turn complete",
+					"session", sessionKey,
+					"response_len", len(fullResponse),
+					"buffered", true)
+				textParts = nil
+				pending = 0
+			case event.Type == EventModelSwitch:
+				e.relayModelSwitch(p, replyCtx, sessionKey, state, event.ModelSwitch)
+			case event.Type == EventPermissionRequest:
+				// The agent's own turn is waiting for an answer that no one
+				// will give, and the queued message would get no reply until
+				// the idle timeout. Answer it as the unsolicited reader does.
+				e.answerBufferedPermission(state, p, replyCtx, event)
+				pending++
+			case event.Type == EventError:
+				// Whatever came before the error belongs to a turn that
+				// will never complete.
+				dropped += pending + 1
+				textParts = nil
+				pending = 0
+			default:
+				if event.Type == EventText && event.Content != "" {
+					textParts = append(textParts, event.Content)
+				}
+				pending++
+			}
+		default:
+			return
+		}
+	}
+}
+
+// bufferedPermissionAnswerWait bounds how long the drain waits for the agent
+// to take a permission answer before the queued message is sent after it.
+const bufferedPermissionAnswerWait = 5 * time.Second
+
+// answerBufferedPermission answers a permission request found in the buffer,
+// where no user turn is there to ask: allowed under /yolo, otherwise denied
+// with a notice to the user. AskUserQuestion is always denied, since
+// approving it would answer nothing.
+func (e *Engine) answerBufferedPermission(state *interactiveState, p Platform, replyCtx any, event Event) {
+	state.mu.Lock()
+	allow := state.approveAll && event.ToolName != "AskUserQuestion"
+	agentSession := state.agentSession
+	state.mu.Unlock()
+
+	result := PermissionResult{Behavior: "deny", Message: "denied: no active user turn"}
+	if allow {
+		result = PermissionResult{Behavior: "allow", UpdatedInput: event.ToolInputRaw}
+	}
+	if agentSession != nil {
+		answered := make(chan struct{})
+		go func() {
+			defer close(answered)
+			if err := agentSession.RespondPermission(event.RequestID, result); err != nil {
+				slog.Error("buffered permission: failed to respond", "request", event.RequestID, "error", err)
+			}
+		}()
+		select {
+		case <-answered:
+		case <-time.After(bufferedPermissionAnswerWait):
+			slog.Warn("buffered permission: answer still pending", "request", event.RequestID)
+		}
+	}
+	if !allow {
+		toolName := event.ToolName
+		if toolName == "" {
+			toolName = "(unknown)"
+		}
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgBackgroundAutoDenied), toolName))
+	}
+}
+
+// deliverUnsolicitedResult sends the reply of a turn the agent ran on its own
+// and records it in the session history. textParts are the turn's EventText
+// contents, used when the result event carries no text.
+//
+// A NO_REPLY marker is handled as in a foreground turn: a bare marker sends
+// nothing, a trailing one is cut off. History keeps the original text, so the
+// agent still sees that it chose to stay silent.
+func (e *Engine) deliverUnsolicitedResult(p Platform, replyCtx any, session *Session, sessions *SessionManager, sessionKey string, result Event, textParts []string) string {
+	fullResponse := result.Content
+	if fullResponse == "" && len(textParts) > 0 {
+		fullResponse = strings.Join(textParts, "")
+	}
+	outgoing := fullResponse
+	if result.UsageLimit != nil {
+		reply, silent := e.usageLimitReplyFor(result)
+		switch {
+		case silent:
+			// Same rule as a foreground turn: already announced, so send one
+			// short queued line rather than nothing — silence here reads as a
+			// lost message, and the alternative (dropping a card) reads as a
+			// retraction.
+			outgoing, reply = e.i18n.T(MsgUsageLimitQueued), ""
+		case e.usageLimitReply == "":
+			reply = ""
+		default:
+			outgoing = reply
+		}
+		e.reportUsageLimit(p, sessionKey, "", result, reply)
+	} else {
+		e.usageLimitCleared()
+	}
+	if isSilentReply(outgoing) {
+		outgoing = ""
+	} else if stripped, ok := stripTrailingSilent(outgoing); ok {
+		outgoing = stripped
+	}
+	if outgoing == "" && fullResponse != "" {
+		slog.Info("silent reply suppressed", "session", session.ID, "unsolicited", true)
+	}
+	if strings.TrimSpace(outgoing) != "" {
+		for _, chunk := range SplitMessageCodeFenceAware(outgoing, maxPlatformMessageLen) {
+			e.send(p, replyCtx, chunk)
+		}
+	}
+	session.AddHistory("assistant", fullResponse)
+	sessions.Save()
+	return fullResponse
+}
+
 // replyWithError applies outgoing rate limiting and p.Reply.
 func (e *Engine) replyWithError(p Platform, replyCtx any, content string) error {
 	if err := e.waitOutgoing(p); err != nil {
@@ -12542,6 +13012,10 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 
 	if prefix == "act" && cmd == "/model" {
 		return e.handleModelCardAction(args, sessionKey)
+	}
+
+	if prefix == "act" && cmd == modelFallbackKeepAction {
+		return e.simpleCard(e.i18n.T(MsgModelSwitchCardTitle), "grey", e.i18n.Tf(MsgModelSwitchKept, args))
 	}
 
 	if prefix == "act" {

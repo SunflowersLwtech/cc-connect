@@ -30,6 +30,18 @@ func newAllowFromTestPlatform(t *testing.T, allowFrom string) (*interactivePlatf
 	ip.handler = func(_ core.Platform, msg *core.Message) {
 		msgCh <- msg
 	}
+	// Card actions dispatch only after the sender and chat names are resolved,
+	// and a lookup is an API call. With these fake credentials the real API
+	// answers slowly (or not at all), which can push a dispatch past the
+	// waits in these tests: a wanted message arrives too late, an unwanted
+	// one arrives after waitNoMessage stopped looking. Seed every ID the
+	// tests use so the dispatch path does no I/O; the callback itself must
+	// not block on lookups either way
+	// (TestOnCardAction_NameLookupDoesNotBlockCallback).
+	for _, id := range []string{"ou_allowed", "ou_other", "ou_anyone", "ou_attacker", "ou_a", "ou_b", "ou_c", "ou_d"} {
+		ip.userNameCache.Store(id, id)
+	}
+	ip.chatNameCache.Store("oc_test_chat", "Test Chat")
 	return ip, msgCh
 }
 

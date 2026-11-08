@@ -467,7 +467,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 	encryptKey, _ := opts["encrypt_key"].(string)
 
-	var clientOpts []lark.ClientOptionFunc
+	clientOpts := []lark.ClientOptionFunc{lark.WithHttpClient(newFeishuHTTPClient())}
 	if domain != lark.FeishuBaseUrl {
 		clientOpts = append(clientOpts, lark.WithOpenBaseUrl(domain))
 	}
@@ -901,12 +901,10 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		}
 
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.dispatchCoreMessage(&core.Message{
+		p.dispatchCardActionMessage(chatID, &core.Message{
 			SessionKey:           sessionKey,
 			Platform:             p.platformName,
 			UserID:               userID,
-			UserName:             p.resolveUserName(userID),
-			ChatName:             p.resolveChatName(chatID),
 			Content:              responseText,
 			ReplyCtx:             rctx,
 			IsPermissionResponse: true,
@@ -933,12 +931,10 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	// askq: — AskUserQuestion option selected, forward as user message
 	if strings.HasPrefix(actionVal, "askq:") {
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.dispatchCoreMessage(&core.Message{
+		p.dispatchCardActionMessage(chatID, &core.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
 			Content:    actionVal,
 			ReplyCtx:   rctx,
 		})
@@ -968,12 +964,10 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
 
-		go p.dispatchCoreMessage(&core.Message{
+		p.dispatchCardActionMessage(chatID, &core.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
 			Content:    cmdText,
 			ReplyCtx:   rctx,
 		})
@@ -1011,7 +1005,9 @@ func (p *Platform) addReaction(messageID string) string {
 }
 
 func (p *Platform) addReactionWithEmoji(messageID, emojiType string) string {
-	return p.addReactionWithEmojiContext(context.Background(), messageID, emojiType)
+	ctx, cancel := context.WithTimeout(context.Background(), feishuAttemptTimeout)
+	defer cancel()
+	return p.addReactionWithEmojiContext(ctx, messageID, emojiType)
 }
 
 func (p *Platform) addReactionWithEmojiContext(ctx context.Context, messageID, emojiType string) string {
@@ -1043,7 +1039,9 @@ func (p *Platform) removeReaction(messageID, reactionID string) {
 	if reactionID == "" || messageID == "" {
 		return
 	}
-	resp, err := p.client.Im.MessageReaction.Delete(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), feishuAttemptTimeout)
+	defer cancel()
+	resp, err := p.client.Im.MessageReaction.Delete(ctx,
 		larkim.NewDeleteMessageReactionReqBuilder().
 			MessageId(messageID).
 			ReactionId(reactionID).
@@ -1209,6 +1207,18 @@ func isMessageWithdrawnError(err error) bool {
 		return false
 	}
 	return isMessageWithdrawnCode(0, err.Error())
+}
+
+// dispatchCardActionMessage forwards a card button action to the engine. The
+// name lookups are network calls, so they run inside the goroutine: as
+// arguments of a go statement they would be evaluated synchronously and hold
+// the card callback past Feishu's response window.
+func (p *Platform) dispatchCardActionMessage(chatID string, msg *core.Message) {
+	go func() {
+		msg.UserName = p.resolveUserName(msg.UserID)
+		msg.ChatName = p.resolveChatName(chatID)
+		p.dispatchCoreMessage(msg)
+	}()
 }
 
 func (p *Platform) dispatchCoreMessage(msg *core.Message) {
@@ -2223,20 +2233,57 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 				slog.Warn(p.tag()+": download media thumbnail failed", "error", err)
 			}
 		}
+		// Local patch (same as the upstream PR): also fetch the video itself.
+		var files []core.FileAttachment
+		if mediaBody.FileKey != "" {
+			if videoData, err := p.downloadResource(messageID, mediaBody.FileKey, "file"); err == nil {
+				name := mediaBody.FileName
+				if name == "" {
+					name = "video.mp4"
+				}
+				slog.Info(p.tag()+": media video downloaded", "file_name", name, "size", len(videoData))
+				files = append(files, core.FileAttachment{MimeType: "video/mp4", Data: videoData, FileName: name})
+			} else {
+				slog.Warn(p.tag()+": download media video failed", "error", err)
+				text += " (video download failed; only the cover image is attached)"
+			}
+		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
 		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
+			Content: text, ExtraContent: quoted.text, Images: images, Files: files, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
+	case "system":
+		// Generated by Feishu (member joined, chat created, …), not written
+		// by the user. Forwarding it would start an agent turn and post a
+		// reply nobody asked for.
+		slog.Info(p.tag()+": not forwarding system message", "message_id", messageID)
+
 	default:
-		slog.Debug(p.tag()+": ignoring unsupported message type", "type", msgType)
+		// video_chat, share_chat, location, todo, vote, interactive, … : no
+		// dedicated handling, but the user still expects a reply, so pass the
+		// content on as text rather than dropping the message.
+		slog.Info(p.tag()+": forwarding message type without dedicated handling as text", "type", msgType, "message_id", messageID)
+		p.flushImageBatchForSession(sessionKey)
+		p.dispatchCoreMessage(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: describeOtherMessage(msgType, content), ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
 	}
 }
+
+// nameLookupTimeout bounds the display-name lookups that run before an inbound
+// message reaches the engine. The SDK client has no request timeout, so without
+// it a request on a dead keep-alive connection blocks the message forever.
+var nameLookupTimeout = 5 * time.Second
 
 // resolveUserName fetches a user's display name via the Contact API, with caching.
 func (p *Platform) resolveUserName(openID string) string {
@@ -2246,7 +2293,9 @@ func (p *Platform) resolveUserName(openID string) string {
 	if cached, ok := p.userNameCache.Load(openID); ok {
 		return cached.(string)
 	}
-	resp, err := p.client.Contact.User.Get(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), nameLookupTimeout)
+	defer cancel()
+	resp, err := p.client.Contact.User.Get(ctx,
 		larkcontact.NewGetUserReqBuilder().
 			UserId(openID).
 			UserIdType("open_id").
@@ -2316,19 +2365,23 @@ func (p *Platform) resolveChatName(chatID string) string {
 	if cached, ok := p.chatNameCache.Load(chatID); ok {
 		return cached.(string)
 	}
-	resp, err := p.client.Im.Chat.Get(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), nameLookupTimeout)
+	defer cancel()
+	resp, err := p.client.Im.Chat.Get(ctx,
 		larkim.NewGetChatReqBuilder().ChatId(chatID).Build())
 	if err != nil {
 		slog.Debug(p.tag()+": resolve chat name failed", "chat_id", chatID, "error", err)
 		return chatID
 	}
-	if !resp.Success() || resp.Data == nil || resp.Data.Name == nil {
+	if !resp.Success() || resp.Data == nil {
 		slog.Debug(p.tag()+": resolve chat name: no data", "chat_id", chatID, "code", resp.Code)
 		return chatID
 	}
-	name := *resp.Data.Name
-	if name == "" {
-		return chatID
+	// p2p chats have no name. That answer is final, so cache the fallback too;
+	// otherwise every DM repeats this request before it can be dispatched.
+	name := chatID
+	if resp.Data.Name != nil && *resp.Data.Name != "" {
+		name = *resp.Data.Name
 	}
 	p.chatNameCache.Store(chatID, name)
 	return name
@@ -2665,7 +2718,11 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 	case "interactive":
 		text = extractInteractiveCardText(content)
 	default:
-		text = fmt.Sprintf("[%s]", item.MsgType)
+		if isResourceMessageType(item.MsgType) {
+			text = fmt.Sprintf("[%s]", item.MsgType)
+		} else {
+			text = describeOtherMessage(item.MsgType, content)
+		}
 	}
 	// Empty quoted payloads (no text, no images, no files) are dropped here:
 	// keeping a chainMessage with an empty text would otherwise produce an
@@ -3307,7 +3364,11 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 			p.formatMergeForwardTree(msgID, childrenMap, nameMap, sb, images, files, depth+1)
 
 		default:
-			sb.WriteString(fmt.Sprintf("%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType))
+			if isResourceMessageType(msgType) {
+				fmt.Fprintf(sb, "%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType)
+			} else {
+				fmt.Fprintf(sb, "%s[%s] %s: %s\n", indent, ts, senderName, describeOtherMessage(msgType, content))
+			}
 		}
 	}
 }
@@ -4149,7 +4210,8 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
-		Content(content)
+		Content(content).
+		Uuid(newMessageUUID())
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
@@ -4161,7 +4223,7 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	return p.withTransientRetry(ctx, "reply", func() error {
+	return p.withAttemptRetry(ctx, "reply", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -4182,9 +4244,10 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			ReceiveId(chatID).
 			MsgType(msgType).
 			Content(content).
+			Uuid(newMessageUUID()).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, op, func() error {
+	return p.withAttemptRetry(ctx, op, func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Create(ctx, req, options...)
 			if err != nil {
@@ -4241,7 +4304,7 @@ func (p *Platform) replayAPIClient() *lark.Client {
 
 func newFeishuReplayClient(appID, appSecret, domain string) *lark.Client {
 	var opts []lark.ClientOptionFunc
-	opts = append(opts, lark.WithEnableTokenCache(false))
+	opts = append(opts, lark.WithEnableTokenCache(false), lark.WithHttpClient(newFeishuHTTPClient()))
 	if domain != "" && domain != lark.FeishuBaseUrl {
 		opts = append(opts, lark.WithOpenBaseUrl(domain))
 	}
@@ -4284,6 +4347,10 @@ func isTransientError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+	// An attempt that hit its own deadline (see withAttemptTimeout).
+	if errors.Is(err, errFeishuAttemptTimeout) {
+		return true
+	}
 	// Unwrapped string checks for common transient symptoms that may
 	// appear in wrapped Feishu SDK errors.
 	msg := err.Error()
@@ -4294,6 +4361,7 @@ func isTransientError(err error) bool {
 		"TLS handshake timeout",
 		"server misbehaving",
 		"connection refused",
+		"http2: client connection lost", // HTTP/2 health check gave up on the connection
 	} {
 		if strings.Contains(msg, substr) {
 			return true
@@ -5237,7 +5305,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
 			Build()
 		var resp *larkim.ReplyMessageResp
-		if err := p.withTransientRetry(ctx, "send preview", func() error {
+		if err := p.withAttemptRetry(ctx, "send preview", func(ctx context.Context) error {
 			return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 				var err error
 				resp, err = client.Im.Message.Reply(ctx, req, options...)
@@ -5262,10 +5330,11 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 				ReceiveId(chatID).
 				MsgType(larkim.MsgTypeInteractive).
 				Content(sendContent).
+				Uuid(newMessageUUID()).
 				Build()).
 			Build()
 		var resp *larkim.CreateMessageResp
-		if err := p.withTransientRetry(ctx, "send preview", func() error {
+		if err := p.withAttemptRetry(ctx, "send preview", func(ctx context.Context) error {
 			return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 				var err error
 				resp, err = client.Im.Message.Create(ctx, req, options...)
@@ -5474,7 +5543,7 @@ func (p *Platform) patchCardMessage(ctx context.Context, messageID, cardJSON str
 			Content(cardJSON).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, "patch message", func() error {
+	return p.withAttemptRetry(ctx, "patch message", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "patch message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Patch(ctx, req, options...)
 			if err != nil {
@@ -5584,7 +5653,7 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 	req := larkim.NewDeleteMessageReqBuilder().
 		MessageId(h.messageID).
 		Build()
-	return p.withTransientRetry(ctx, "delete preview message", func() error {
+	return p.withAttemptRetry(ctx, "delete preview message", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "delete preview message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Delete(ctx, req, options...)
 			if err != nil {
