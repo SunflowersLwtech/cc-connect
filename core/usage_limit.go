@@ -58,9 +58,6 @@ func usageLimitResetClock(limit *UsageLimit, text string, now time.Time) string 
 	return fmt.Sprintf("%02d:%02d", h, mins)
 }
 
-// usageLimitUnknownReset stands in for {reset_at} when the reset time is unknown.
-const usageLimitUnknownReset = "稍后"
-
 // usageLimitReplyFor decides what the chat gets for a turn refused for a
 // usage limit. Without usage_limit_reply it is the agent's own text. With it,
 // the configured text, {reset_at} filled in, goes out once per limit
@@ -83,7 +80,8 @@ func (e *Engine) usageLimitReplyFor(event Event) (reply string, silent bool) {
 	}
 	clock := usageLimitResetClock(event.UsageLimit, event.Content, now)
 	if clock == "" {
-		clock = usageLimitUnknownReset
+		// Stands in for {reset_at} when the reset time is unknown.
+		clock = e.i18n.T(MsgUsageLimitResetUnknown)
 	}
 	return strings.ReplaceAll(e.usageLimitReply, "{reset_at}", clock), false
 }

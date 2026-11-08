@@ -160,7 +160,7 @@ func TestUsageLimitReply_UnsetKeepsEveryRefusal(t *testing.T) {
 }
 
 // Without a reset time from the agent the reply takes the one in the
-// refusal text, and says 稍后 when there is none.
+// refusal text, and says "later" in the engine's language when there is none.
 func TestUsageLimitReply_ResetTimeFallbacks(t *testing.T) {
 	le := newLimitEnv(t, episodeReply)
 	sent := le.turn(Event{Type: EventResult, Content: "You've hit your session limit · resets 8:30pm (Asia/Shanghai)", Done: true, UsageLimit: &UsageLimit{}})
@@ -168,10 +168,22 @@ func TestUsageLimitReply_ResetTimeFallbacks(t *testing.T) {
 		t.Fatalf("sent %q, want the reset time from the text", sent)
 	}
 
-	le2 := newLimitEnv(t, episodeReply)
-	sent = le2.turn(Event{Type: EventResult, Content: "You've hit your usage limit", Done: true, UsageLimit: &UsageLimit{}})
-	if len(sent) != 1 || sent[0] != strings.ReplaceAll(episodeReply, "{reset_at}", usageLimitUnknownReset) {
-		t.Fatalf("sent %q, want the unknown-time wording", sent)
+	for _, tc := range []struct {
+		lang Language
+		word string
+	}{
+		{LangEnglish, "later"},
+		{LangChinese, "稍后"},
+		{LangTraditionalChinese, "稍後"},
+		{LangJapanese, "後ほど"},
+		{LangSpanish, "más tarde"},
+	} {
+		le2 := newLimitEnv(t, episodeReply)
+		le2.e.i18n.SetLang(tc.lang)
+		sent = le2.turn(Event{Type: EventResult, Content: "You've hit your usage limit", Done: true, UsageLimit: &UsageLimit{}})
+		if want := strings.ReplaceAll(episodeReply, "{reset_at}", tc.word); len(sent) != 1 || sent[0] != want {
+			t.Fatalf("%s: sent %q, want the unknown-time wording %q", tc.lang, sent, want)
+		}
 	}
 }
 

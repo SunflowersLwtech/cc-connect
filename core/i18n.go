@@ -221,6 +221,7 @@ const (
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
 	MsgEmptyResponse             MsgKey = "empty_response"
 	MsgUsageLimitQueued          MsgKey = "usage_limit_queued"
+	MsgUsageLimitResetUnknown    MsgKey = "usage_limit_reset_unknown"
 	MsgPermissionPrompt          MsgKey = "permission_prompt"
 	MsgPermissionAllowed         MsgKey = "permission_allowed"
 	MsgPermissionApproveAll      MsgKey = "permission_approve_all"
@@ -916,6 +917,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 已排隊，額度恢復後處理。",
 		LangJapanese:           "⏳ キューに追加しました。上限が回復したら実行します。",
 		LangSpanish:            "⏳ En cola: se ejecutará cuando se restablezca el límite.",
+	},
+	MsgUsageLimitResetUnknown: {
+		LangEnglish:            "later",
+		LangChinese:            "稍后",
+		LangTraditionalChinese: "稍後",
+		LangJapanese:           "後ほど",
+		LangSpanish:            "más tarde",
 	},
 	MsgPermissionPrompt: {
 		LangEnglish:            "⚠️ **Permission Request**\n\nAgent wants to use **%s**:\n\n```\n%s\n```\n\nReply **allow** / **deny** / **allow all** (skip all future prompts this session).",
