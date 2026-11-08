@@ -163,6 +163,7 @@ type Platform struct {
 	mentionMap             map[string]string // agent name -> open_id (for outbound @ resolution)
 	userNameCache          sync.Map          // open_id -> display name
 	chatNameCache          sync.Map          // chat_id -> chat name
+	nameLookupFailures     sync.Map          // "user:"+open_id / "chat:"+chat_id -> time.Time until which the lookup is not retried
 	chatMemberCache        sync.Map          // chatID -> *chatMemberEntry
 	recalledMu             sync.Mutex
 	recalledMsgIDs         map[string]time.Time // message_id -> recall time, short TTL race guard
@@ -1215,8 +1216,7 @@ func isMessageWithdrawnError(err error) bool {
 // the card callback past Feishu's response window.
 func (p *Platform) dispatchCardActionMessage(chatID string, msg *core.Message) {
 	go func() {
-		msg.UserName = p.resolveUserName(msg.UserID)
-		msg.ChatName = p.resolveChatName(chatID)
+		msg.UserName, msg.ChatName = p.resolveNames(msg.UserID, chatID)
 		p.dispatchCoreMessage(msg)
 	}()
 }
@@ -1924,11 +1924,7 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 	}
 
 	// Resolve user and chat names asynchronously so SDK dispatcher is not blocked.
-	userName := ""
-	if userID != "" {
-		userName = p.resolveUserName(userID)
-	}
-	chatName := p.resolveChatName(chatID)
+	userName, chatName := p.resolveNames(userID, chatID)
 
 	// If this message is a reply to another message, fetch the quoted content
 	// and prepend it so the agent has full context.
@@ -2285,6 +2281,43 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 // it a request on a dead keep-alive connection blocks the message forever.
 var nameLookupTimeout = 5 * time.Second
 
+// nameLookupFailureTTL is how long a name whose lookup request failed (timed
+// out, could not connect) is not looked up again; the ID stands in for it
+// meanwhile. While the API hangs, every message would otherwise wait out
+// nameLookupTimeout again. An answer with an error code (e.g. a missing
+// scope) comes back quickly and is not remembered, so it is retried at once.
+var nameLookupFailureTTL = time.Minute
+
+func (p *Platform) nameLookupFailedRecently(key string) bool {
+	v, ok := p.nameLookupFailures.Load(key)
+	if !ok {
+		return false
+	}
+	if time.Now().Before(v.(time.Time)) {
+		return true
+	}
+	p.nameLookupFailures.CompareAndDelete(key, v)
+	return false
+}
+
+func (p *Platform) noteNameLookupFailure(key string) {
+	p.nameLookupFailures.Store(key, time.Now().Add(nameLookupFailureTTL))
+}
+
+// resolveNames looks up the sender's and the chat's display names at the same
+// time, so an API that does not answer holds a message for one
+// nameLookupTimeout instead of two.
+func (p *Platform) resolveNames(userID, chatID string) (userName, chatName string) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		userName = p.resolveUserName(userID)
+	}()
+	chatName = p.resolveChatName(chatID)
+	<-done
+	return userName, chatName
+}
+
 // resolveUserName fetches a user's display name via the Contact API, with caching.
 func (p *Platform) resolveUserName(openID string) string {
 	if !isValidFeishuLookupID(openID) {
@@ -2292,6 +2325,9 @@ func (p *Platform) resolveUserName(openID string) string {
 	}
 	if cached, ok := p.userNameCache.Load(openID); ok {
 		return cached.(string)
+	}
+	if p.nameLookupFailedRecently("user:" + openID) {
+		return openID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), nameLookupTimeout)
 	defer cancel()
@@ -2301,6 +2337,7 @@ func (p *Platform) resolveUserName(openID string) string {
 			UserIdType("open_id").
 			Build())
 	if err != nil {
+		p.noteNameLookupFailure("user:" + openID)
 		slog.Debug(p.tag()+": resolve user name failed", "open_id", openID, "error", err)
 		return openID
 	}
@@ -2365,11 +2402,15 @@ func (p *Platform) resolveChatName(chatID string) string {
 	if cached, ok := p.chatNameCache.Load(chatID); ok {
 		return cached.(string)
 	}
+	if p.nameLookupFailedRecently("chat:" + chatID) {
+		return chatID
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), nameLookupTimeout)
 	defer cancel()
 	resp, err := p.client.Im.Chat.Get(ctx,
 		larkim.NewGetChatReqBuilder().ChatId(chatID).Build())
 	if err != nil {
+		p.noteNameLookupFailure("chat:" + chatID)
 		slog.Debug(p.tag()+": resolve chat name failed", "chat_id", chatID, "error", err)
 		return chatID
 	}
