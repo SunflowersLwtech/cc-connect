@@ -231,6 +231,64 @@ func TestReplyMessage_RetriesWhenServerNeverAnswers(t *testing.T) {
 	}
 }
 
+// New messages (background replies, timer output) take the same retry: the
+// second attempt must reuse the uuid so Feishu drops the copy if the first
+// request did get through.
+func TestCreateMessage_RetriesWhenServerNeverAnswers(t *testing.T) {
+	setFeishuTimeouts(t, 30*time.Second, 30*time.Second, 300*time.Millisecond, 10*time.Millisecond)
+	api := newFakeOpenAPI(t, func(n int, w http.ResponseWriter, r *http.Request, conn *freezeConn) {
+		if n == 1 {
+			hangUntilCancelled(r)
+			return
+		}
+		answerMessage(w)
+	})
+	p := api.platform(t)
+
+	err := runWithin(t, 10*time.Second, "send", api, func() error {
+		return p.createMessage(context.Background(), "oc_chat", "text", `{"text":"hello"}`, "send")
+	})
+	if err != nil {
+		t.Fatalf("send error = %v, want success on retry", err)
+	}
+	reqs := api.messageRequests()
+	if len(reqs) != 2 || reqs[0].path != "/open-apis/im/v1/messages" || reqs[1].path != reqs[0].path {
+		t.Fatalf("message requests = %+v, want 2 creates (one timed out, one retried)", reqs)
+	}
+	if reqs[0].uuid == "" || reqs[0].uuid != reqs[1].uuid {
+		t.Fatalf("uuids = %q, %q; want the same non-empty uuid on both attempts", reqs[0].uuid, reqs[1].uuid)
+	}
+}
+
+// The streaming card opened as a new message (no message to reply to)
+// retries with the same uuid too, or a retry could leave two cards.
+func TestSendPreviewStart_CreateRetriesWhenServerNeverAnswers(t *testing.T) {
+	setFeishuTimeouts(t, 30*time.Second, 30*time.Second, 300*time.Millisecond, 10*time.Millisecond)
+	api := newFakeOpenAPI(t, func(n int, w http.ResponseWriter, r *http.Request, conn *freezeConn) {
+		if n == 1 {
+			hangUntilCancelled(r)
+			return
+		}
+		answerMessage(w)
+	})
+	p := api.platform(t)
+
+	err := runWithin(t, 10*time.Second, "preview", api, func() error {
+		_, err := p.SendPreviewStart(context.Background(), replyContext{chatID: "oc_chat", sessionKey: "feishu:oc_chat:ou_user"}, "thinking")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("preview error = %v, want success on retry", err)
+	}
+	reqs := api.messageRequests()
+	if len(reqs) != 2 || reqs[0].path != "/open-apis/im/v1/messages" || reqs[1].path != reqs[0].path {
+		t.Fatalf("message requests = %+v, want 2 creates (one timed out, one retried)", reqs)
+	}
+	if reqs[0].uuid == "" || reqs[0].uuid != reqs[1].uuid {
+		t.Fatalf("uuids = %q, %q; want the same non-empty uuid on both attempts", reqs[0].uuid, reqs[1].uuid)
+	}
+}
+
 // A caller that gives up while a retry is pending gets its answer at once
 // instead of after the backoff and another attempt.
 func TestReplyMessage_StopsRetryingWhenCallerCancels(t *testing.T) {
