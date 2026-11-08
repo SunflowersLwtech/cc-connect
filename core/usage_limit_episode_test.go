@@ -239,6 +239,48 @@ func TestExecuteTimerJob_UsageLimitedTurnIsJobError(t *testing.T) {
 	}
 }
 
+// A refusal left on the session by an earlier user turn is not the timer
+// run's: a run whose own turn is answered succeeds. Otherwise whoever
+// scheduled the job reads the answered prompt as unanswered and sends it
+// again.
+func TestExecuteTimerJob_EarlierUserRefusalDoesNotFailAnsweredRun(t *testing.T) {
+	plat := &cujReplyCtxPlatform{stubPlatformEngine: &stubPlatformEngine{n: "test"}}
+	agent := &cujAgent{}
+	e := NewEngine("test", agent, []Platform{plat}, t.TempDir()+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	e.SetUsageLimitReply(episodeReply)
+
+	resets := time.Now().Add(time.Hour)
+	agent.setNextSessionEvents([]Event{limitedAt(resets)}, 0)
+	e.ReceiveMessage(plat, &Message{SessionKey: "test:erin", Platform: "test", MessageID: "m1", UserID: "erin", UserName: "erin", Content: "hello", ReplyCtx: "ctx"})
+	want := strings.ReplaceAll(episodeReply, "{reset_at}", clockOf(resets))
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		sent := plat.getSent()
+		if len(sent) > 0 && sent[len(sent)-1] == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refused user turn sent %q, want %q", sent, want)
+		}
+	}
+	session := e.sessions.GetOrCreateActive("test:erin")
+	waitForSessionIdle(t, session)
+	session.usageLimitMu.Lock()
+	recorded := session.usageLimit != nil
+	session.usageLimitMu.Unlock()
+	if !recorded {
+		t.Fatal("the refused user turn left no refusal on the session, so the run below cannot tell a stale refusal from none")
+	}
+
+	plat.clearSent()
+	if err := e.ExecuteTimerJob(&TimerJob{ID: "t1", Project: "test", SessionKey: "test:erin", Prompt: "[mesh 消息] 来自 x：hi"}); err != nil {
+		t.Fatalf("answered run after a refused user turn returned %v, want nil", err)
+	}
+	if sent := plat.getSent(); len(sent) == 0 || sent[len(sent)-1] != "ok" {
+		t.Fatalf("timer run sent %q, want it to end with the agent's answer", sent)
+	}
+}
+
 // Turns the agent runs on its own follow the same once-per-episode rule.
 func TestDeliverUnsolicitedResult_UsageLimitOncePerEpisode(t *testing.T) {
 	le := newLimitEnv(t, episodeReply)
