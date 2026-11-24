@@ -7192,6 +7192,32 @@ func TestHandlePendingPermission_TimerFallback(t *testing.T) {
 	}
 }
 
+// A typed answer ("允许" in the chat, no card click) goes through the whole
+// message handler and must reach a timer run's prompt the same way a click
+// does: both carry the plain key and end in handlePendingPermission.
+func TestHandleMessage_TypedAllowReachesTimerRun(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+	timerKey := "test:chat:user1#timer:s43"
+	e.interactiveMu.Lock()
+	e.interactiveStates[timerKey] = &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-typed",
+			ToolInput: map[string]any{"command": "ls"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Unlock()
+	e.handleMessage(p, &Message{SessionKey: "test:chat:user1", Platform: "test", UserID: "user1", UserName: "user1", Content: "允许", ReplyCtx: "ctx"})
+	if rec.calls != 1 || rec.lastID != "req-typed" || rec.lastResult.Behavior != "allow" {
+		t.Fatalf("typed 允许 answered the timer run %d times (%q %q), want one allow for req-typed", rec.calls, rec.lastID, rec.lastResult.Behavior)
+	}
+}
+
 func TestHandlePendingPermission_CronFallback(t *testing.T) {
 	e := newTestEngine()
 	p := &stubPlatformEngine{n: "test"}
