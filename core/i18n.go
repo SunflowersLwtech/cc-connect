@@ -696,6 +696,7 @@ const (
 	MsgWsInitLocalPathsDisabled MsgKey = "ws_init_local_paths_disabled"
 	MsgBackgroundAutoDenied     MsgKey = "background_auto_denied"
 	MsgPermissionTimedOut       MsgKey = "permission_timed_out"
+	MsgPermCardExpired          MsgKey = "perm_card_expired"
 
 	// Agent system-prompt tool sections (Issue #1655). These are appended
 	// to the agent's own system prompt by core/interfaces.go AgentSystemPromptForLang
@@ -874,6 +875,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 錯誤: %v",
 		LangJapanese:           "❌ エラー: %v",
 		LangSpanish:            "❌ Error: %v",
+	},
+	MsgPermCardExpired: {
+		LangEnglish:            "⏰ Expired: nobody answered within %s, denied automatically",
+		LangChinese:            "⏰ 已过期：%s 内没人答，已自动拒绝",
+		LangTraditionalChinese: "⏰ 已過期：%s 內沒人回應，已自動拒絕",
+		LangJapanese:           "⏰ 期限切れ：%s 以内に応答がなく、自動的に拒否されました",
+		LangSpanish:            "⏰ Caducada: nadie respondió en %s; se denegó automáticamente",
 	},
 	MsgPermissionTimedOut: {
 		LangEnglish:            "⏰ Nobody answered the permission request for `%s` within %s; it was denied automatically.",

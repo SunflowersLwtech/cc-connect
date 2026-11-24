@@ -52,6 +52,34 @@ func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core
 	return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
 }
 
+// SendCardMessage is SendCard that also returns the ID of the message the
+// card was sent as (core.CardMessageSender), so the card can be patched
+// later. It takes the same path as SendCard: a reply in the thread when the
+// session is a thread, otherwise a new message in the chat.
+func (p *interactivePlatform) SendCardMessage(ctx context.Context, rctx any, card *core.Card) (string, error) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return "", fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	if rc.chatID == "" {
+		return "", fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
+	}
+	cardJSON := renderCard(card, rc.sessionKey)
+	if !p.noReplyToTrigger && p.shouldReplyInThread(rc) && p.shouldUseThreadOrReplyAPI(rc) {
+		return p.replyMessageID(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+	}
+	return p.createMessageID(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
+}
+
+// PatchCardMessage replaces the card in message messageID with card
+// (core.CardMessageSender).
+func (p *interactivePlatform) PatchCardMessage(ctx context.Context, messageID string, card *core.Card) error {
+	if messageID == "" {
+		return fmt.Errorf("%s: patch card: no message ID", p.tag())
+	}
+	return p.patchCardMessage(ctx, messageID, renderCard(card, ""), "patch card")
+}
+
 // RefreshCard updates a previously rendered card in-place using the Patch API.
 // It looks up the messageID stored from the most recent card action callback
 // for the given session key and patches that message with the new card content.
@@ -64,21 +92,24 @@ func (p *interactivePlatform) RefreshCard(ctx context.Context, sessionKey string
 		return fmt.Errorf("%s: no tracked card messageID for session %q", p.tag(), sessionKey)
 	}
 
-	cardJSON := renderCard(card, sessionKey)
+	return p.patchCardMessage(ctx, msgID, renderCard(card, sessionKey), "refresh card")
+}
+
+func (p *interactivePlatform) patchCardMessage(ctx context.Context, msgID, cardJSON, op string) error {
 	req := larkim.NewPatchMessageReqBuilder().
 		MessageId(msgID).
 		Body(larkim.NewPatchMessageReqBodyBuilder().
 			Content(cardJSON).
 			Build()).
 		Build()
-	return p.withAttemptRetry(ctx, "refresh card", func(ctx context.Context) error {
-		return p.withFreshTenantAccessTokenRetry(ctx, "refresh card", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+	return p.withAttemptRetry(ctx, op, func(ctx context.Context) error {
+		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Patch(ctx, req, options...)
 			if err != nil {
-				return fmt.Errorf("%s: refresh card: %w", p.tag(), err)
+				return fmt.Errorf("%s: %s: %w", p.tag(), op, err)
 			}
 			if !resp.Success() {
-				return fmt.Errorf("%s: refresh card code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+				return fmt.Errorf("%s: %s code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
 			}
 			return nil
 		})

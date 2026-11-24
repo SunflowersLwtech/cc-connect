@@ -3851,11 +3851,19 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	_, err := p.replyMessageID(ctx, rc, msgType, content)
+	return err
+}
+
+// replyMessageID is replyMessage that also returns the new message's ID
+// ("" if the API did not report one).
+func (p *Platform) replyMessageID(ctx context.Context, rc replyContext, msgType, content string) (string, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	return p.withAttemptRetry(ctx, "reply", func(ctx context.Context) error {
+	var id string
+	err := p.withAttemptRetry(ctx, "reply", func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -3864,12 +3872,23 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				id = *resp.Data.MessageId
+			}
 			return nil
 		})
 	})
+	return id, err
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+	_, err := p.createMessageID(ctx, chatID, msgType, content, op)
+	return err
+}
+
+// createMessageID is createMessage that also returns the new message's ID
+// ("" if the API did not report one).
+func (p *Platform) createMessageID(ctx context.Context, chatID, msgType, content, op string) (string, error) {
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
@@ -3879,7 +3898,8 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			Uuid(newMessageUUID()).
 			Build()).
 		Build()
-	return p.withAttemptRetry(ctx, op, func(ctx context.Context) error {
+	var id string
+	err := p.withAttemptRetry(ctx, op, func(ctx context.Context) error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Create(ctx, req, options...)
 			if err != nil {
@@ -3888,9 +3908,13 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			if !resp.Success() {
 				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				id = *resp.Data.MessageId
+			}
 			return nil
 		})
 	})
+	return id, err
 }
 
 func (p *Platform) withFreshTenantAccessTokenRetry(ctx context.Context, operation string, fn feishuRequestFunc) error {

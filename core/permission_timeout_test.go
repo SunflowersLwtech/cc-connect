@@ -1,7 +1,9 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +61,15 @@ type permTimeoutEnv struct {
 func startPermTimeoutTurn(t *testing.T, timeout time.Duration) *permTimeoutEnv {
 	t.Helper()
 	p := &stubPlatformEngine{n: "test"}
-	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	return startPermTimeoutTurnOn(t, timeout, p, p)
+}
+
+// startPermTimeoutTurnOn is startPermTimeoutTurn on platform plat; sent records
+// what plat sends as plain messages.
+func startPermTimeoutTurnOn(t *testing.T, timeout time.Duration, plat Platform, sent *stubPlatformEngine) *permTimeoutEnv {
+	t.Helper()
+	p := sent
+	e := NewEngine("test", &stubAgent{}, []Platform{plat}, "", LangEnglish)
 	e.SetPermissionTimeout(timeout)
 	hookOut := filepath.Join(t.TempDir(), "timed-out.json")
 	async := false
@@ -67,7 +77,7 @@ func startPermTimeoutTurn(t *testing.T, timeout time.Duration) *permTimeoutEnv {
 	key := "test:user1"
 	session := e.sessions.GetOrCreateActive(key)
 	sess := newPermRecordSession()
-	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	state := &interactiveState{agentSession: sess, platform: plat, replyCtx: "ctx"}
 	e.interactiveMu.Lock()
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
@@ -279,4 +289,101 @@ func TestPermissionTimeout_ZeroWaitsForever(t *testing.T) {
 	if _, err := os.Stat(env.hookOut); err == nil {
 		t.Error("permission.timed_out hook ran without a timeout")
 	}
+}
+
+// permCardPlatform sends cards as messages with IDs (CardMessageSender) and
+// records every card sent and every patch.
+type permCardPlatform struct {
+	stubPlatformEngine
+	cmu     sync.Mutex
+	cards   []*Card
+	patches []permCardPatch
+}
+
+type permCardPatch struct {
+	id   string
+	card *Card
+}
+
+func (p *permCardPlatform) SendCard(ctx context.Context, rctx any, c *Card) error {
+	_, err := p.SendCardMessage(ctx, rctx, c)
+	return err
+}
+func (p *permCardPlatform) ReplyCard(ctx context.Context, rctx any, c *Card) error {
+	return p.SendCard(ctx, rctx, c)
+}
+func (p *permCardPlatform) SendCardMessage(_ context.Context, _ any, c *Card) (string, error) {
+	p.cmu.Lock()
+	defer p.cmu.Unlock()
+	p.cards = append(p.cards, c)
+	return fmt.Sprintf("om_card_%d", len(p.cards)), nil
+}
+func (p *permCardPlatform) PatchCardMessage(_ context.Context, id string, c *Card) error {
+	p.cmu.Lock()
+	defer p.cmu.Unlock()
+	p.patches = append(p.patches, permCardPatch{id, c})
+	return nil
+}
+func (p *permCardPlatform) snapshot() ([]*Card, []permCardPatch) {
+	p.cmu.Lock()
+	defer p.cmu.Unlock()
+	return append([]*Card(nil), p.cards...), append([]permCardPatch(nil), p.patches...)
+}
+
+// On a timeout the permission card itself is replaced by one without
+// buttons that says it expired, so nobody can click it afterwards.
+func TestPermissionTimeout_ExpiresTheCard(t *testing.T) {
+	cp := &permCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	env := startPermTimeoutTurnOn(t, 80*time.Millisecond, cp, &cp.stubPlatformEngine)
+	cmd := `exec 3<>/dev/tcp/127.0.0.1/9 # timeout test, do not click`
+	env.askBash(cmd)
+	if a := env.waitAnswer(2 * time.Second); a.Behavior != "deny" {
+		t.Fatalf("answer %q, want deny", a.Behavior)
+	}
+	var cards []*Card
+	var patches []permCardPatch
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end) && len(patches) == 0; time.Sleep(10 * time.Millisecond) {
+		cards, patches = cp.snapshot()
+	}
+	if len(cards) != 1 || !cards[0].HasButtons() {
+		t.Fatalf("permission card not sent as one card with buttons: %d cards", len(cards))
+	}
+	if len(patches) != 1 {
+		t.Fatalf("%d patches of the card, want 1", len(patches))
+	}
+	pt := patches[0]
+	if pt.id != "om_card_1" {
+		t.Errorf("patched message %q, want the permission card om_card_1", pt.id)
+	}
+	if pt.card.HasButtons() {
+		t.Error("expired card still has buttons")
+	}
+	if pt.card.Header == nil || !strings.Contains(pt.card.Header.Title, "Expired") || !strings.Contains(pt.card.Header.Title, "denied automatically") {
+		t.Errorf("expired card header = %+v", pt.card.Header)
+	}
+	if !strings.Contains(pt.card.RenderText(), "127.0.0.1/9") {
+		t.Errorf("expired card does not show the request: %q", pt.card.RenderText())
+	}
+	if !env.e.handlePendingPermission(cp, &Message{SessionKey: env.key, ReplyCtx: "ctx", IsPermissionResponse: true}, "allow", "") {
+		t.Error("late click not consumed")
+	}
+	env.noAnswerFor(150 * time.Millisecond)
+	env.finishTurn()
+}
+
+// A user answer leaves the card alone: only a timeout marks it expired.
+func TestPermissionTimeout_AnsweredCardNotPatched(t *testing.T) {
+	cp := &permCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	env := startPermTimeoutTurnOn(t, 300*time.Millisecond, cp, &cp.stubPlatformEngine)
+	env.askBash("ls")
+	waitPermPending(t, env.state)
+	if !env.e.handlePendingPermission(cp, &Message{SessionKey: env.key, ReplyCtx: "ctx"}, "allow", "") {
+		t.Fatal("allow not handled")
+	}
+	env.waitAnswer(time.Second)
+	env.noAnswerFor(500 * time.Millisecond)
+	if _, patches := cp.snapshot(); len(patches) != 0 {
+		t.Errorf("card patched after the user answered: %d", len(patches))
+	}
+	env.finishTurn()
 }

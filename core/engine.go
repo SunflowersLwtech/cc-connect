@@ -761,6 +761,10 @@ type pendingPermission struct {
 	// allow/deny or the permission timeout. The other one then does nothing,
 	// so the agent never gets two answers to one request.
 	decided atomic.Bool
+	// cardMessageID and cardToolInput are the permission card's message and
+	// the tool input it shows, kept so a timeout can mark that card expired.
+	cardMessageID string
+	cardToolInput string
 }
 
 // claim reports whether the caller is the first to decide this request.
@@ -3688,14 +3692,14 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	state, pending := e.lookupPending(iKey)
 
 	if state == nil || pending == nil {
-		// Fallback: cron new-per-run sessions use composite keys like
-		// "key#cron:sid" which won't match the plain sessionKey from
-		// platform permission button callbacks.
+		// Fallback: cron and timer new-per-run sessions use composite keys
+		// like "key#cron:sid" and "key#timer:sid" (ExecuteTimerJob), which
+		// won't match the plain sessionKey from platform permission button
+		// callbacks or a typed answer.
 		e.interactiveMu.Lock()
-		prefix := iKey + "#cron:"
 		var cronKeys []string
 		for k := range e.interactiveStates {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(k, iKey+"#cron:") || strings.HasPrefix(k, iKey+"#timer:") {
 				cronKeys = append(cronKeys, k)
 			}
 		}
@@ -3886,6 +3890,17 @@ func (e *Engine) denyTimedOutPermission(state *interactiveState, session *Sessio
 		}
 	}
 	pending.resolve()
+	// Replace the card with one without buttons, so it shows the request is
+	// over and cannot be clicked. A click that still arrives is dropped.
+	if cms, ok := p.(CardMessageSender); ok && pending.cardMessageID != "" {
+		card := NewCard().
+			Title(fmt.Sprintf(e.i18n.T(MsgPermCardExpired), formatPermissionTimeout(timeout)), "grey").
+			Markdown(fmt.Sprintf(e.i18n.T(MsgPermCardBody), pending.ToolName, pending.cardToolInput)).
+			Build()
+		if err := cms.PatchCardMessage(e.ctx, pending.cardMessageID, e.renderCardForPlatform(p, card)); err != nil {
+			slog.Warn("could not mark the timed-out permission card expired", "request_id", pending.RequestID, "error", err)
+		}
+	}
 	e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgPermissionTimedOut), pending.ToolName, formatPermissionTimeout(timeout)))
 	extra := map[string]any{
 		"tool_name":    pending.ToolName,
@@ -6276,7 +6291,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				toolInput := truncateIf(event.ToolInput, permLimit)
 				prompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
-				e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput)
+				pending.cardToolInput = toolInput
+				pending.cardMessageID = e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput)
 			}
 
 			// Stop idle timer while waiting for user permission response;
@@ -12460,7 +12476,7 @@ func (e *Engine) resolveOutboundSessionTarget(sessionKey string, hasAttachments 
 
 // sendPermissionPrompt sends a permission prompt with interactive buttons when
 // the platform supports them. Fallback chain: InlineButtonSender → CardSender → plain text.
-func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName, toolInput string) {
+func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName, toolInput string) (cardMessageID string) {
 	e.hooks.Emit(HookEvent{
 		Event:    HookEventPermissionRequested,
 		Platform: p.Name(),
@@ -12481,10 +12497,10 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 		}
 		if err := e.waitOutgoing(p); err != nil {
 			slog.Warn("sendPermissionPrompt: outgoing wait cancelled", "platform", p.Name(), "error", err)
-			return
+			return ""
 		}
 		if err := bs.SendWithButtons(e.ctx, replyCtx, prompt, buttons); err == nil {
-			return
+			return ""
 		} else {
 			slog.Warn("sendPermissionPrompt: inline buttons failed, falling back", "error", err)
 		}
@@ -12514,11 +12530,31 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 			Buttons(allowAllBtn).
 			Note(e.i18n.T(MsgPermCardNote)).
 			Build()
-		e.sendWithCard(p, replyCtx, card)
-		return
+		return e.sendPermissionCard(p, replyCtx, card)
 	}
 
 	e.send(p, replyCtx, prompt)
+	return ""
+}
+
+// sendPermissionCard sends a permission card and returns the ID of its
+// message when the platform reports one (CardMessageSender), so a timeout
+// can replace it with an expired card. Otherwise it is sendWithCard.
+func (e *Engine) sendPermissionCard(p Platform, replyCtx any, card *Card) string {
+	cms, ok := p.(CardMessageSender)
+	if !ok {
+		e.sendWithCard(p, replyCtx, card)
+		return ""
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+		return ""
+	}
+	id, err := cms.SendCardMessage(e.ctx, replyCtx, e.renderCardForPlatform(p, card))
+	if err != nil {
+		slog.Error("card send failed", "platform", p.Name(), "error", err)
+	}
+	return id
 }
 
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.

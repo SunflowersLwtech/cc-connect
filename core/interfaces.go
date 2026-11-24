@@ -299,6 +299,16 @@ type CardSender interface {
 	ReplyCard(ctx context.Context, replyCtx any, card *Card) error
 }
 
+// CardMessageSender is an optional extension of CardSender for platforms
+// that can report the ID of the message a card was sent as and patch that
+// message later. The engine uses it for permission cards: when nobody
+// answers in time, the card is replaced by one without buttons, so it cannot
+// be clicked after the request was denied.
+type CardMessageSender interface {
+	SendCardMessage(ctx context.Context, replyCtx any, card *Card) (messageID string, err error)
+	PatchCardMessage(ctx context.Context, messageID string, card *Card) error
+}
+
 // CardNavigationHandler is called by platforms to render a card for in-place
 // card updates (e.g. Feishu card.action.trigger callback). The action string
 // uses prefixes like "nav:/model" or "act:/model 3".
