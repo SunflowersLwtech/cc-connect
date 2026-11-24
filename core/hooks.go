@@ -25,6 +25,7 @@ const (
 	HookEventCronTriggered      HookEventType = "cron.triggered"
 	HookEventTimerTriggered     HookEventType = "timer.triggered"
 	HookEventPermissionRequested HookEventType = "permission.requested"
+	HookEventPermissionTimedOut  HookEventType = "permission.timed_out"
 	HookEventError              HookEventType = "error"
 )
 

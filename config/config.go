@@ -114,6 +114,11 @@ type Config struct {
 	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"`  // max minutes between consecutive agent events; 0 = no timeout; default 120
 	BusyTimeoutMins    *int                    `toml:"busy_timeout_mins,omitempty"`  // minutes a dead agent's session busy lock may be held before the next message breaks it; 0 = disable; default 2
 	MaxTurnTimeMins    *int                    `toml:"max_turn_time_mins,omitempty"` // absolute wall-clock cap per turn in minutes; 0 = disabled (default)
+	// PermissionTimeoutMins is how long a tool permission prompt (Allow/Deny)
+	// waits for an answer before the request is denied automatically. 0 or
+	// unset waits forever. AskUserQuestion prompts are not affected. A
+	// project's permission_timeout_mins overrides it.
+	PermissionTimeoutMins *int `toml:"permission_timeout_mins,omitempty"`
 	// WorkspaceIdleTimeoutMins controls the workspace idle reaper timeout
 	// (multi-workspace mode) for every engine in the process. 0 disables
 	// reaping. Default: 15 minutes. Defined as a top-level (process-global)
@@ -521,6 +526,9 @@ type ProjectConfig struct {
 	// AgentSessionIdleTimeoutMins 在指定分钟数后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下一条消息继续恢复。0 或 nil 表示禁用。
 	AgentSessionIdleTimeoutMins *int `toml:"agent_session_idle_timeout_mins,omitempty"`
+	// PermissionTimeoutMins overrides the top-level permission_timeout_mins
+	// for this project; 0 waits forever, nil uses the top-level value.
+	PermissionTimeoutMins *int `toml:"permission_timeout_mins,omitempty"`
 	// RunAsUser, when set, causes the agent command for this project to be
 	// spawned under a different Unix user via `sudo -n -iu <user> --`. This
 	// provides OS-level file-system isolation from the supervisor user who
