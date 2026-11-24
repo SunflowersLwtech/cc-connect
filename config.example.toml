@@ -169,6 +169,15 @@ level = "info" # debug, info, warn, error
 # 推荐值：30–60。默认 0（禁用）。
 # max_turn_time_mins = 0  # default: disabled / 默认禁用
 
+# How long a tool permission prompt (Allow/Deny) waits for an answer before the
+# request is denied automatically, in minutes. The agent is told to do it another
+# way that does not need approval, the chat is told, and the permission.timed_out
+# hook fires. AskUserQuestion prompts always wait. 0 or unset waits forever.
+# [[projects]].permission_timeout_mins overrides this value.
+# 工具权限确认（允许/拒绝）等多少分钟没人答就自动拒绝：告诉 agent 换一种不需要审批的写法、在聊天里说一声、
+# 触发 permission.timed_out 钩子。AskUserQuestion 的提问不受影响。0 或不设 = 一直等。项目级同名设置优先。
+# permission_timeout_mins = 0  # default: wait forever / 默认一直等
+
 # Auto-reset the active session after the user has been inactive for a while.
 # Unlike idle_timeout_mins, this does not detect stuck agent execution. It
 # rotates to a fresh cc-connect session when the user comes back after being idle.

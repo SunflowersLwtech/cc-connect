@@ -415,6 +415,10 @@ type Engine struct {
 	eventIdleTimeout    time.Duration
 	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
 	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	// permissionTimeoutNanos is how long a tool permission prompt waits for
+	// an answer before it is denied (0 = wait forever). Atomic because
+	// reloadConfig sets it while turns read it.
+	permissionTimeoutNanos atomic.Int64
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -753,7 +757,14 @@ type pendingPermission struct {
 	CurrentQuestion int            // index of the question currently being asked
 	Resolved        chan struct{}  // closed when user responds
 	resolveOnce     sync.Once
+	// decided is set by whichever answers the agent first: the user's
+	// allow/deny or the permission timeout. The other one then does nothing,
+	// so the agent never gets two answers to one request.
+	decided atomic.Bool
 }
+
+// claim reports whether the caller is the first to decide this request.
+func (pp *pendingPermission) claim() bool { return pp.decided.CompareAndSwap(false, true) }
 
 func (s *interactiveState) stopSignal() <-chan struct{} {
 	s.mu.Lock()
@@ -1489,6 +1500,15 @@ func (e *Engine) SetStreamPreviewCfg(cfg StreamPreviewCfg) {
 // periodic tool events keep the idle timer alive indefinitely; the turn timer caps them.
 func (e *Engine) SetMaxTurnTime(d time.Duration) {
 	e.maxTurnTime = d
+}
+
+// SetPermissionTimeout sets how long a tool permission prompt (Allow/Deny)
+// waits for an answer before the request is denied automatically; 0 waits
+// forever (default). AskUserQuestion prompts always wait. The idle timer is
+// stopped while a prompt waits, so without this a prompt nobody answers
+// keeps the session busy indefinitely.
+func (e *Engine) SetPermissionTimeout(d time.Duration) {
+	e.permissionTimeoutNanos.Store(int64(d))
 }
 
 // SetStaleLockBreakAfter sets how long the busy lock may be held by a dead
@@ -3775,6 +3795,13 @@ found:
 
 	lower := strings.ToLower(strings.TrimSpace(content))
 
+	// The permission timeout may have denied this request a moment ago; an
+	// answer that loses that race is dropped instead of answering twice.
+	if (isApproveAllResponse(lower) || isAllowResponse(lower) || isDenyResponse(lower)) && !pending.claim() {
+		slog.Info("dropping permission answer: the request was already decided", "request_id", pending.RequestID)
+		return true
+	}
+
 	if isApproveAllResponse(lower) {
 		state.mu.Lock()
 		state.approveAll = true
@@ -3818,6 +3845,66 @@ found:
 	pending.resolve()
 
 	return true
+}
+
+// permissionTimeoutMessage is what the agent reads when nobody answered its
+// tool permission prompt in time. It asks for another way rather than a retry:
+// the same call would ask again and wait again.
+func permissionTimeoutMessage(timeout time.Duration) string {
+	return fmt.Sprintf("Nobody answered this permission request within %s, so it was denied automatically. "+
+		"Do it another way that does not need approval; running the same command again will ask again. "+
+		"（权限确认 %s 内没人答，已自动拒绝：换一种不需要审批的写法，原样重跑还会再问。）", formatPermissionTimeout(timeout), formatPermissionTimeout(timeout))
+}
+
+func formatPermissionTimeout(d time.Duration) string {
+	if d >= time.Minute && d%time.Minute == 0 {
+		return fmt.Sprintf("%d min", int(d/time.Minute))
+	}
+	return d.String()
+}
+
+// denyTimedOutPermission answers a tool permission prompt that waited past
+// permission_timeout_mins: it denies the request, tells the chat, and emits
+// permission.timed_out so a hook can tell someone who was not watching the
+// chat (the session may be a scheduled run nobody looks at). The caller has
+// claimed the request.
+func (e *Engine) denyTimedOutPermission(state *interactiveState, session *Session, sessionKey string, p Platform, replyCtx any, pending *pendingPermission, timeout time.Duration) {
+	state.mu.Lock()
+	if state.pending == pending {
+		state.pending = nil
+	}
+	agentSession := state.agentSession
+	state.mu.Unlock()
+	slog.Warn("permission request timed out, denying",
+		"request_id", pending.RequestID, "tool", pending.ToolName, "timeout", timeout)
+	if agentSession != nil {
+		if err := agentSession.RespondPermission(pending.RequestID, PermissionResult{
+			Behavior: "deny",
+			Message:  permissionTimeoutMessage(timeout),
+		}); err != nil {
+			slog.Error("failed to deny a timed-out permission request", "request_id", pending.RequestID, "error", err)
+		}
+	}
+	pending.resolve()
+	e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgPermissionTimedOut), pending.ToolName, formatPermissionTimeout(timeout)))
+	extra := map[string]any{
+		"tool_name":    pending.ToolName,
+		"request_id":   pending.RequestID,
+		"timeout_mins": int(timeout / time.Minute),
+	}
+	if cmd, ok := pending.ToolInput["command"].(string); ok {
+		extra["command"] = cmd
+	}
+	if session != nil {
+		extra["session_id"] = session.ID
+		extra["session_name"] = session.GetName()
+		extra["agent_session_id"] = session.GetAgentSessionID()
+	}
+	platform := ""
+	if p != nil {
+		platform = p.Name()
+	}
+	e.hooks.Emit(HookEvent{Event: HookEventPermissionTimedOut, SessionKey: sessionKey, Platform: platform, Content: pending.InputPreview, Extra: extra})
 }
 
 // lookupPending returns the interactive state and its pending permission for
@@ -6199,8 +6286,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
-			slog.Info("permission resolved", "request_id", event.RequestID)
+			if timeout := time.Duration(e.permissionTimeoutNanos.Load()); timeout > 0 && !isAskQuestion {
+				t := time.NewTimer(timeout)
+				select {
+				case <-pending.Resolved:
+					t.Stop()
+					slog.Info("permission resolved", "request_id", event.RequestID)
+				case <-t.C:
+					if pending.claim() {
+						e.denyTimedOutPermission(state, session, sessionKey, p, replyCtx, pending, timeout)
+					} else {
+						<-pending.Resolved // the user's answer won the race and resolves right after it responds
+						slog.Info("permission resolved", "request_id", event.RequestID)
+					}
+				}
+			} else {
+				<-pending.Resolved
+				slog.Info("permission resolved", "request_id", event.RequestID)
+			}
 
 			// The stream preview was frozen+detached when this permission
 			// request was emitted, so any subsequent EventText in this turn

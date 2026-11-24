@@ -692,6 +692,9 @@ func main() {
 			}
 		}
 
+		// Wire the tool permission timeout (project overrides top level; 0 = wait forever)
+		engine.SetPermissionTimeout(permissionTimeout(cfg, &proj))
+
 		// Wire max turn time (absolute per-turn wall-clock cap; 0 = disabled)
 		if cfg.MaxTurnTimeMins != nil && *cfg.MaxTurnTimeMins > 0 {
 			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
@@ -1737,6 +1740,20 @@ func setupLogger(level string, w io.Writer) {
 
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
 // (display, providers, commands) to the given engine.
+// permissionTimeout is how long a tool permission prompt waits before it is
+// denied: the project's permission_timeout_mins, else the top-level one; 0 or
+// less (or neither set) waits forever.
+func permissionTimeout(cfg *config.Config, proj *config.ProjectConfig) time.Duration {
+	mins := cfg.PermissionTimeoutMins
+	if proj != nil && proj.PermissionTimeoutMins != nil {
+		mins = proj.PermissionTimeoutMins
+	}
+	if mins == nil || *mins <= 0 {
+		return 0
+	}
+	return time.Duration(*mins) * time.Minute
+}
+
 func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -1820,6 +1837,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		// explicitly so those stale idle-close timers cannot fire later.
 		engine.SetAgentSessionIdleTimeout(0)
 	}
+	// Reload the tool permission timeout; removing the option goes back to waiting forever.
+	engine.SetPermissionTimeout(permissionTimeout(cfg, proj))
 
 	// Reload instant reply
 	if cfg.InstantReply.Enabled != nil && *cfg.InstantReply.Enabled {
