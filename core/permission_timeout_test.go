@@ -387,3 +387,42 @@ func TestPermissionTimeout_AnsweredCardNotPatched(t *testing.T) {
 	}
 	env.finishTurn()
 }
+
+// A typed "拒绝" that arrives after the timeout claimed the request does not
+// answer the agent a second time.
+func TestPermissionTimeout_TypedDenyAfterClaimIsDropped(t *testing.T) {
+	env := startPermTimeoutTurn(t, 0)
+	env.askBash("ls")
+	pending := waitPermPending(t, env.state)
+	if !pending.claim() { // the timeout got there first
+		t.Fatal("fresh request already claimed")
+	}
+	if !env.e.handlePendingPermission(env.p, &Message{SessionKey: env.key, ReplyCtx: "ctx"}, "拒绝", "") {
+		t.Error("typed deny to a claimed request was not consumed")
+	}
+	env.noAnswerFor(150 * time.Millisecond)
+	pending.resolve()
+	env.finishTurn()
+}
+
+// A typed "拒绝" before the timeout is the only answer: the timer firing
+// afterwards neither answers again nor reports a timeout.
+func TestPermissionTimeout_TypedDenyBeforeTimeout(t *testing.T) {
+	env := startPermTimeoutTurn(t, 200*time.Millisecond)
+	env.askBash("ls")
+	waitPermPending(t, env.state)
+	if !env.e.handlePendingPermission(env.p, &Message{SessionKey: env.key, ReplyCtx: "ctx"}, "拒绝", "") {
+		t.Fatal("typed deny not handled")
+	}
+	if a := env.waitAnswer(time.Second); a.Behavior != "deny" || strings.Contains(a.Message, "automatically") {
+		t.Fatalf("answer %+v, want the user's deny", a)
+	}
+	env.noAnswerFor(400 * time.Millisecond)
+	env.finishTurn()
+	if n := len(env.sess.getAnswers()); n != 1 {
+		t.Errorf("%d answers, want exactly one", n)
+	}
+	if _, err := os.Stat(env.hookOut); err == nil {
+		t.Error("permission.timed_out hook ran although the user had answered")
+	}
+}
